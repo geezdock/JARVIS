@@ -7,18 +7,24 @@ import toast from 'react-hot-toast';
 import Card from '../../components/ui/Card';
 import Button from '../../components/ui/Button';
 import api from '../../lib/axios';
+import { INTERVIEW_ROLE_OPTIONS } from '../../lib/interviewRoles';
 
 export default function CandidateDetails() {
   const { id } = useParams();
   const [loading, setLoading] = useState(true);
   const [details, setDetails] = useState(null);
   const [analyzing, setAnalyzing] = useState(false);
+  const [savingRole, setSavingRole] = useState(false);
+  const [targetRole, setTargetRole] = useState('');
+  const [adminOverrideRole, setAdminOverrideRole] = useState('');
 
   useEffect(() => {
     const fetchCandidateDetails = async () => {
       try {
         const response = await api.get(`/admin/candidates/${id}`);
         setDetails(response.data);
+        setTargetRole(response.data?.candidate?.targetRole || '');
+        setAdminOverrideRole(response.data?.candidate?.adminOverrideRole || '');
       } catch (_error) {
         setDetails(null);
       } finally {
@@ -39,6 +45,24 @@ export default function CandidateDetails() {
       toast.error('Unable to analyze resume right now');
     } finally {
       setAnalyzing(false);
+    }
+  };
+
+  const onSaveInterviewRole = async () => {
+    try {
+      setSavingRole(true);
+      const response = await api.patch(`/admin/candidates/${id}/interview-role`, {
+        targetRole: targetRole || null,
+        adminOverrideRole: adminOverrideRole || null,
+      });
+      setDetails(response.data);
+      setTargetRole(response.data?.candidate?.targetRole || '');
+      setAdminOverrideRole(response.data?.candidate?.adminOverrideRole || '');
+      toast.success('Interview role settings updated');
+    } catch (_error) {
+      toast.error('Unable to update interview role settings');
+    } finally {
+      setSavingRole(false);
     }
   };
 
@@ -74,8 +98,57 @@ export default function CandidateDetails() {
 
       <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }}>
         <h1 className="text-3xl font-black text-slate-900">{candidate.name}</h1>
-        <p className="mt-2 text-slate-600">Applied for {candidate.position}</p>
+        <p className="mt-2 text-slate-600">Interview role: {candidate.position}</p>
+        <p className="mt-1 text-xs text-slate-500">Source: {candidate.interviewRoleSource?.replaceAll('_', ' ') || 'default'}</p>
       </motion.div>
+
+      <Card>
+        <h2 className="text-lg font-bold text-slate-900">Interview Role Controls</h2>
+        <p className="mt-1 text-sm text-slate-600">
+          Candidate target role is preferred unless admin override is set.
+        </p>
+        <div className="mt-4 grid gap-4 md:grid-cols-2">
+          <div>
+            <label htmlFor="targetRole" className="mb-1.5 block text-sm font-medium text-slate-700">
+              Candidate target role
+            </label>
+            <select
+              id="targetRole"
+              value={targetRole}
+              onChange={(event) => setTargetRole(event.target.value)}
+              className="h-11 w-full rounded-xl border border-slate-300 bg-white px-3.5 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[#0d9488] focus:ring-4 focus:ring-[#0d9488]/20"
+            >
+              <option value="">Not set</option>
+              {INTERVIEW_ROLE_OPTIONS.map((option) => (
+                <option key={option} value={option}>
+                  {option}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label htmlFor="adminOverrideRole" className="mb-1.5 block text-sm font-medium text-slate-700">
+              Admin override role
+            </label>
+            <select
+              id="adminOverrideRole"
+              value={adminOverrideRole}
+              onChange={(event) => setAdminOverrideRole(event.target.value)}
+              className="h-11 w-full rounded-xl border border-slate-300 bg-white px-3.5 text-sm text-slate-900 shadow-sm outline-none transition focus:border-[#0d9488] focus:ring-4 focus:ring-[#0d9488]/20"
+            >
+              <option value="">No override</option>
+              {INTERVIEW_ROLE_OPTIONS.map((option) => (
+                <option key={option} value={option}>
+                  {option}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+        <Button className="mt-4" onClick={onSaveInterviewRole} disabled={savingRole}>
+          {savingRole ? 'Saving...' : 'Save Role Settings'}
+        </Button>
+      </Card>
 
       <div className="grid gap-4 lg:grid-cols-3">
         <Card className="lg:col-span-2">

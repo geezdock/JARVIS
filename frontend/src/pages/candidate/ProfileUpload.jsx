@@ -6,11 +6,13 @@ import toast from 'react-hot-toast';
 import api from '../../lib/axios';
 import Button from '../../components/ui/Button';
 import Card from '../../components/ui/Card';
+import Input from '../../components/ui/Input';
 import { buildResumePath, MAX_RESUME_SIZE_BYTES, RESUME_BUCKET } from '../../lib/resumeStorage';
 import { supabase } from '../../lib/supabase';
 
 export default function ProfileUpload() {
   const [file, setFile] = useState(null);
+  const [targetRole, setTargetRole] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [lastUpload, setLastUpload] = useState(null);
@@ -95,6 +97,11 @@ export default function ProfileUpload() {
       return;
     }
 
+    if (!targetRole.trim()) {
+      toast.error('Please enter a target interview role');
+      return;
+    }
+
     let uploadedPath = null;
     setUploadProgress(0);
 
@@ -130,6 +137,7 @@ export default function ProfileUpload() {
         type: file.type,
         filePath: uploadedPath,
         fileUrl: publicUrl,
+        targetRole: targetRole.trim(),
         submittedAt: new Date().toISOString(),
       });
 
@@ -164,6 +172,21 @@ export default function ProfileUpload() {
         <p className="mt-2 text-sm text-slate-600">Upload your latest PDF resume for AI-based screening.</p>
 
         <form onSubmit={onSubmit} className="mt-6 space-y-4">
+          <div>
+            <label htmlFor="targetRole" className="mb-1.5 block text-sm font-medium text-slate-700">
+              Target interview role
+            </label>
+            <Input
+              id="targetRole"
+              name="targetRole"
+              type="text"
+              value={targetRole}
+              onChange={(event) => setTargetRole(event.target.value)}
+              placeholder="e.g., Frontend Developer"
+              required
+            />
+          </div>
+
           <label className="flex cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed border-teal-300 bg-teal-50/60 p-8 text-center transition hover:bg-teal-50">
             <Upload className="text-teal-700" size={28} />
             <span className="mt-2 text-sm font-semibold text-slate-900">Click to upload PDF</span>

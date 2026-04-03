@@ -15,6 +15,27 @@ const deriveRole = (user) => {
   return user.email?.includes('admin') ? 'admin' : 'candidate';
 };
 
+const deriveDisplayName = (user) => {
+  if (!user) return null;
+
+  const firstName = user.user_metadata?.first_name?.trim();
+  const lastName = user.user_metadata?.last_name?.trim();
+
+  if (firstName && lastName) {
+    return `${firstName} ${lastName}`;
+  }
+
+  if (firstName) {
+    return firstName;
+  }
+
+  if (lastName) {
+    return lastName;
+  }
+
+  return user.user_metadata?.full_name?.trim() || null;
+};
+
 export const useAuth = () => {
   return useContext(AuthContext);
 };
@@ -22,6 +43,7 @@ export const useAuth = () => {
 export const AuthProvider = ({ children }) => {
   const [user, setUser] = useState(null);
   const [role, setRole] = useState(null);
+  const [displayName, setDisplayName] = useState(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -38,6 +60,7 @@ export const AuthProvider = ({ children }) => {
 
         setUser(session?.user ?? null);
         setRole(deriveRole(session?.user));
+        setDisplayName(deriveDisplayName(session?.user));
       } catch (err) {
         console.error('Unexpected error during auth initialization:', err);
       } finally {
@@ -52,6 +75,7 @@ export const AuthProvider = ({ children }) => {
     } = supabase.auth.onAuthStateChange((_event, session) => {
       setUser(session?.user ?? null);
       setRole(deriveRole(session?.user));
+      setDisplayName(deriveDisplayName(session?.user));
       setLoading(false);
     });
 
@@ -71,7 +95,13 @@ export const AuthProvider = ({ children }) => {
     return data;
   };
 
-  const signup = async ({ email, password, role: selectedRole = 'candidate' }) => {
+  const signup = async ({
+    email,
+    password,
+    role: selectedRole = 'candidate',
+    firstName = '',
+    lastName = '',
+  }) => {
     setLoading(true);
     const { data, error } = await supabase.auth.signUp({
       email,
@@ -79,6 +109,9 @@ export const AuthProvider = ({ children }) => {
       options: {
         data: {
           role: selectedRole,
+          first_name: firstName,
+          last_name: lastName,
+          full_name: [firstName, lastName].filter(Boolean).join(' '),
         },
       },
     });
@@ -97,6 +130,7 @@ export const AuthProvider = ({ children }) => {
   const value = {
     user,
     role,
+    displayName,
     isAdmin: role === 'admin',
     isCandidate: role === 'candidate',
     loading,

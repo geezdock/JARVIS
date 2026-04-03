@@ -69,7 +69,7 @@ export default function AdminDashboard() {
             <thead>
               <tr className="border-b border-slate-200 text-slate-500">
                 <th className="py-3 pr-4 font-semibold">Candidate</th>
-                <th className="py-3 pr-4 font-semibold">Role</th>
+                <th className="py-3 pr-4 font-semibold">Interview Role</th>
                 <th className="py-3 pr-4 font-semibold">Stage</th>
                 <th className="py-3 pr-4 font-semibold">AI Score</th>
               </tr>
@@ -82,7 +82,10 @@ export default function AdminDashboard() {
                       {candidate.name}
                     </Link>
                   </td>
-                  <td className="py-3 pr-4 text-slate-600">{candidate.role}</td>
+                  <td className="py-3 pr-4 text-slate-600">
+                    <p>{candidate.role}</p>
+                    <p className="text-xs text-slate-400">Source: {candidate.interviewRoleSource?.replaceAll('_', ' ') || 'default'}</p>
+                  </td>
                   <td className="py-3 pr-4 text-slate-600">{candidate.stage}</td>
                   <td className="py-3 pr-4">
                     <span className="rounded-full bg-teal-100 px-2.5 py-1 text-xs font-semibold text-teal-800">

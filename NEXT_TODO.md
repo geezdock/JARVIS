@@ -23,13 +23,13 @@ All endpoints built and Supabase-integrated:
 #### Phase 3: Frontend Auth & Pages (DONE)
 - ✅ Supabase auth context with session management
 - ✅ Login page with email/password authentication
-- ✅ Signup page with role selection
+- ✅ Signup page with first name, last name, and auth role selection
 - ✅ Landing page with navigation
-- ✅ Candidate Dashboard page showing stats and recent uploads
-- ✅ Profile Upload page with file selection
-- ✅ Interview Schedule page with slot management
+- ✅ Candidate Dashboard page showing stats, resume state, and resolved interview role
+- ✅ Profile Upload page with target interview role text input and PDF upload
+- ✅ Interview page with start action and role-specific interview flow/questions
 - ✅ Admin Dashboard page with candidate grid
-- ✅ Admin Candidate Details page with resume info and AI summary
+- ✅ Admin Candidate Details page with resume info, AI summary, and interview role controls
 - ✅ Role-based route protection (authenticated and role-specific guards)
 
 #### Phase 4: UI Components & Styling (DONE)
@@ -106,6 +106,28 @@ All endpoints built and Supabase-integrated:
 - [x] Verify results display properly
 
 **Dependencies:** Phase 6 (File Storage) is complete
+
+---
+
+### Phase 7.5: Role-Aware Interview Routing [100% - DONE]
+
+**Goal:** Ensure interview context and AI analysis are driven by the actual interview role, not auth role.
+
+- [x] Add dedicated fields in `candidates`: `target_role`, `admin_override_role`
+- [x] Keep auth role (`candidate`/`admin`) separate from interview role
+- [x] Add candidate target role text input in [frontend/src/pages/candidate/ProfileUpload.jsx](frontend/src/pages/candidate/ProfileUpload.jsx)
+- [x] Persist candidate target role through `POST /candidate/profile-upload`
+- [x] Add admin override controls in [frontend/src/pages/admin/CandidateDetails.jsx](frontend/src/pages/admin/CandidateDetails.jsx)
+- [x] Add `PATCH /admin/candidates/{candidate_id}/interview-role`
+- [x] Implement role fallback order:
+  - admin override role
+  - candidate target role
+  - inferred role from resume text
+- [x] Use resolved interview role in AI prompt and summaries
+- [x] Generate role-specific interview plans/questions in interview APIs
+- [x] Show resolved interview role and role source in candidate/admin dashboards
+
+**Dependencies:** Phase 7 (AI Resume Summarization) is complete
 
 ---
 
@@ -238,16 +260,17 @@ All endpoints built and Supabase-integrated:
 | Feature | Status | Notes |
 |---------|--------|-------|
 | User Auth (Signup/Login) | ✅ Complete | Email/password with Supabase |
-| Candidate Dashboard | ✅ Complete | Shows stats (needs real data fetch) |
-| Profile Upload Form | ✅ Complete | Form ready, needs file storage integration |
-| Interview Scheduling | ✅ Complete | Slot management ready, UI complete |
+| Candidate Dashboard | ✅ Complete | Shows stats and resolved interview role |
+| Profile Upload Form | ✅ Complete | PDF upload + target interview role text input |
+| Interview Flow | ✅ Complete | Start interview + role-specific plan/questions |
 | Admin Candidate List | ✅ Complete | Shows all candidates with basic scores |
-| Admin Candidate Details | ✅ Complete | Shows stats, mock transcript/summary |
+| Admin Candidate Details | ✅ Complete | AI summary + editable target/override role |
 | Backend API Architecture | ✅ Complete | All endpoints structured and ready |
 | Supabase Integration | ✅ Complete | Auth, RLS, database all configured |
 | UI Components | ✅ Complete | Tailwind, responsive, accessible |
 | **File Storage** | ✅ Complete | Resume uploads stored in Supabase Storage |
 | **AI Summarization** | ✅ Complete | OpenAI-backed analysis with heuristic fallback |
+| **Interview Role Resolution** | ✅ Complete | Dedicated fields + fallback role routing |
 | **Video Interviewing** | ❌ Not Started | No recording capability yet |
 | **Search & Filters** | ❌ Not Started | Basic list view only |
 | **Email Notifications** | ❌ Not Started | No email integration |
@@ -266,7 +289,7 @@ python -m venv .venv
 pip install -r requirements.txt
 copy .env.example .env
 # Edit .env with Supabase credentials
-uvicorn run:app --reload --port 8000
+python -m uvicorn app.main:app --reload --port 8000
 ```
 
 ### Start Frontend

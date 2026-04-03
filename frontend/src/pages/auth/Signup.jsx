@@ -12,6 +12,8 @@ export default function Signup() {
   const navigate = useNavigate();
   const { signup } = useAuth();
   const [form, setForm] = useState({
+    firstName: '',
+    lastName: '',
     email: '',
     password: '',
     confirmPassword: '',
@@ -25,6 +27,11 @@ export default function Signup() {
   };
 
   const validate = () => {
+    if (!form.firstName.trim() || !form.lastName.trim()) {
+      toast.error('Enter your first and last name');
+      return false;
+    }
+
     if (!form.email.includes('@')) {
       toast.error('Enter a valid email');
       return false;
@@ -50,6 +57,8 @@ export default function Signup() {
     try {
       setSubmitting(true);
       await signup({
+        firstName: form.firstName.trim(),
+        lastName: form.lastName.trim(),
         email: form.email.trim(),
         password: form.password,
         role: form.role,
@@ -75,6 +84,38 @@ export default function Signup() {
         <p className="mt-2 text-sm text-slate-600">Join as a candidate or admin reviewer.</p>
 
         <form className="mt-6 space-y-4" onSubmit={onSubmit}>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div>
+              <label htmlFor="firstName" className="mb-1.5 block text-sm font-medium text-slate-700">
+                First name
+              </label>
+              <Input
+                id="firstName"
+                name="firstName"
+                type="text"
+                placeholder="Aanya"
+                value={form.firstName}
+                onChange={onChange}
+                required
+              />
+            </div>
+
+            <div>
+              <label htmlFor="lastName" className="mb-1.5 block text-sm font-medium text-slate-700">
+                Last name
+              </label>
+              <Input
+                id="lastName"
+                name="lastName"
+                type="text"
+                placeholder="Sharma"
+                value={form.lastName}
+                onChange={onChange}
+                required
+              />
+            </div>
+          </div>
+
           <div>
             <label htmlFor="email" className="mb-1.5 block text-sm font-medium text-slate-700">
               Email

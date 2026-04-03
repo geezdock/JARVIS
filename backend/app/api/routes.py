@@ -22,6 +22,7 @@ class ProfileUploadPayload(BaseModel):
     type: str
     filePath: str | None = None
     fileUrl: str | None = None
+    targetRole: str | None = None
     submittedAt: str
 
 
@@ -37,8 +38,139 @@ class ResumeAnalysisPayload(BaseModel):
     force: bool = False
 
 
+class AdminInterviewRolePayload(BaseModel):
+    targetRole: str | None = None
+    adminOverrideRole: str | None = None
+
+
 class SupabaseError(RuntimeError):
     pass
+
+
+INTERVIEW_ROLES = [
+    "Frontend Developer",
+    "Backend Developer",
+    "Data Analyst",
+    "Machine Learning Engineer",
+    "Product Manager",
+    "QA Engineer",
+]
+
+
+def _normalize_role_value(value: str | None) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = re.sub(r"\s+", " ", value).strip()
+    return cleaned or None
+
+
+def _infer_interview_role_from_resume_text(extracted_text: str) -> str | None:
+    normalized_text = re.sub(r"\s+", " ", (extracted_text or "").lower())
+    if not normalized_text:
+        return None
+
+    role_keywords: list[tuple[str, list[str]]] = [
+        ("Frontend Developer", ["react", "frontend", "javascript", "typescript", "css", "ui"]),
+        ("Backend Developer", ["fastapi", "django", "flask", "backend", "api", "postgres", "sql"]),
+        ("Data Analyst", ["sql", "analytics", "dashboard", "power bi", "tableau", "excel"]),
+        ("Machine Learning Engineer", ["machine learning", "ml", "tensorflow", "pytorch", "model", "sklearn"]),
+        ("Product Manager", ["product", "roadmap", "stakeholder", "prioritization", "discovery"]),
+        ("QA Engineer", ["qa", "testing", "test case", "automation", "selenium", "cypress"]),
+    ]
+
+    best_role = None
+    best_hits = 0
+    for role, keywords in role_keywords:
+        hits = sum(1 for keyword in keywords if keyword in normalized_text)
+        if hits > best_hits:
+            best_hits = hits
+            best_role = role
+
+    return best_role if best_hits > 0 else None
+
+
+def _resolve_interview_role(candidate: dict[str, Any], inferred_role: str | None = None) -> tuple[str, str]:
+    admin_override_role = _normalize_role_value(candidate.get("admin_override_role"))
+    if admin_override_role:
+        return admin_override_role, "admin_override_role"
+
+    candidate_target_role = _normalize_role_value(candidate.get("target_role"))
+    if candidate_target_role:
+        return candidate_target_role, "candidate_target_role"
+
+    inferred = _normalize_role_value(inferred_role)
+    if inferred:
+        return inferred, "inferred_role"
+
+    return "General Candidate", "default"
+
+
+def _build_role_specific_interview_plan(interview_role: str) -> dict[str, Any]:
+    flow_by_role: dict[str, dict[str, Any]] = {
+        "Frontend Developer": {
+            "flow": ["UI foundations", "React architecture", "State management", "Debugging"],
+            "questions": [
+                "How would you structure a reusable component library for a large React app?",
+                "When would you use context, reducers, or a dedicated state library?",
+                "How do you improve Core Web Vitals on a slow page?",
+            ],
+        },
+        "Backend Developer": {
+            "flow": ["API design", "Data modeling", "Performance", "Reliability"],
+            "questions": [
+                "How do you version APIs without breaking clients?",
+                "How would you model a many-to-many domain with audit history?",
+                "How do you diagnose and reduce p95 latency in production?",
+            ],
+        },
+        "Data Analyst": {
+            "flow": ["Problem framing", "SQL analysis", "Dashboarding", "Insights communication"],
+            "questions": [
+                "How do you validate data quality before publishing analysis?",
+                "Write the approach for cohort retention analysis using SQL.",
+                "How would you present a conflicting metric trend to business stakeholders?",
+            ],
+        },
+        "Machine Learning Engineer": {
+            "flow": ["Feature engineering", "Model selection", "Evaluation", "MLOps"],
+            "questions": [
+                "How do you choose between a simpler and a more complex model?",
+                "How do you detect and mitigate data leakage?",
+                "What does a robust model monitoring strategy look like after deployment?",
+            ],
+        },
+        "Product Manager": {
+            "flow": ["Discovery", "Prioritization", "Execution", "Measurement"],
+            "questions": [
+                "How do you decide what to build when teams have conflicting priorities?",
+                "Describe a framework you use for trade-offs across impact, effort, and risk.",
+                "Which product metrics define success for a new onboarding flow?",
+            ],
+        },
+        "QA Engineer": {
+            "flow": ["Test strategy", "Automation", "Risk-based testing", "Release quality"],
+            "questions": [
+                "How do you design a test plan for a feature with tight deadlines?",
+                "What should be automated first in a new test suite and why?",
+                "How do you triage flaky tests without slowing delivery?",
+            ],
+        },
+        "General Candidate": {
+            "flow": ["Background", "Problem solving", "Collaboration", "Execution"],
+            "questions": [
+                "Walk through a challenging project and your key contributions.",
+                "How do you break down ambiguous problems into actionable steps?",
+                "How do you handle disagreements in cross-functional teams?",
+            ],
+        },
+    }
+
+    plan = flow_by_role.get(interview_role, flow_by_role["General Candidate"])
+    return {
+        "role": interview_role,
+        "flow": plan["flow"],
+        "questions": plan["questions"],
+    }
 
 
 def _supabase_request(
@@ -239,9 +371,13 @@ def _extract_pdf_text(file_bytes: bytes) -> str:
     return "\n".join(text_parts).strip()
 
 
-def _build_resume_prompt(candidate: dict[str, Any], latest_upload: dict[str, Any], extracted_text: str) -> str:
+def _build_resume_prompt(
+    candidate: dict[str, Any],
+    latest_upload: dict[str, Any],
+    extracted_text: str,
+    interview_role: str,
+) -> str:
     candidate_name = candidate.get("full_name", "the candidate")
-    candidate_role = candidate.get("role", "candidate")
     file_name = latest_upload.get("file_name", "resume.pdf")
     excerpt = extracted_text[:12000] if extracted_text else "No text could be extracted from the PDF."
 
@@ -249,16 +385,21 @@ def _build_resume_prompt(candidate: dict[str, Any], latest_upload: dict[str, Any
         "You are an expert recruitment analyst. Review the resume content and return only valid JSON. "
         "Do not include markdown. The JSON object must contain keys: summary (string), skills (array of strings), "
         "experience_level (string), score (integer 0-100), transcript (string). "
-        f"Candidate name: {candidate_name}. Candidate role: {candidate_role}. File name: {file_name}. "
+        f"Candidate name: {candidate_name}. Target interview role: {interview_role}. File name: {file_name}. "
         f"Resume text:\n{excerpt}"
     )
 
 
-def _openai_resume_analysis(candidate: dict[str, Any], latest_upload: dict[str, Any], extracted_text: str) -> dict[str, Any]:
+def _openai_resume_analysis(
+    candidate: dict[str, Any],
+    latest_upload: dict[str, Any],
+    extracted_text: str,
+    interview_role: str,
+) -> dict[str, Any]:
     if not settings.openai_api_key:
         raise SupabaseError("OPENAI_API_KEY is not configured")
 
-    prompt = _build_resume_prompt(candidate, latest_upload, extracted_text)
+    prompt = _build_resume_prompt(candidate, latest_upload, extracted_text, interview_role)
     payload = {
         "model": settings.openai_model,
         "messages": [
@@ -322,7 +463,6 @@ def _openai_resume_analysis(candidate: dict[str, Any], latest_upload: dict[str, 
 def _build_resume_analysis(candidate: dict[str, Any], latest_upload: dict[str, Any]) -> dict[str, Any]:
     file_url = latest_upload.get("file_url")
     file_name = latest_upload.get("file_name") or "resume.pdf"
-    candidate_role = (candidate.get("role") or "candidate").strip().lower()
 
     extracted_text = ""
     if isinstance(file_url, str) and file_url:
@@ -331,9 +471,19 @@ def _build_resume_analysis(candidate: dict[str, Any], latest_upload: dict[str, A
         except Exception:
             extracted_text = ""
 
+    inferred_role = _infer_interview_role_from_resume_text(extracted_text)
+    resolved_interview_role, resolved_role_source = _resolve_interview_role(candidate, inferred_role)
+    normalized_role = resolved_interview_role.lower()
+
     if settings.openai_api_key:
         try:
-            return _openai_resume_analysis(candidate, latest_upload, extracted_text)
+            analysis = _openai_resume_analysis(candidate, latest_upload, extracted_text, resolved_interview_role)
+            analysis["ai_transcript"] = (
+                f"Interview role source: {resolved_role_source}. "
+                f"Target role used for analysis: {resolved_interview_role}. "
+                f"{analysis.get('ai_transcript', '')}"
+            ).strip()
+            return analysis
         except Exception:
             pass
 
@@ -356,7 +506,7 @@ def _build_resume_analysis(candidate: dict[str, Any], latest_upload: dict[str, A
             matched_skills.append(skill)
 
     if not matched_skills:
-        matched_skills = [candidate.get("role", "candidate").title()]
+        matched_skills = [resolved_interview_role]
 
     experience_signals = [
         ("Intern", ["intern", "internship", "trainee"]),
@@ -380,7 +530,7 @@ def _build_resume_analysis(candidate: dict[str, Any], latest_upload: dict[str, A
     score = 55
     score += min(len(matched_skills) * 6, 24)
     score += min(len(extracted_text) // 500, 10)
-    if candidate_role and candidate_role in normalized_text:
+    if normalized_role and normalized_role in normalized_text:
         score += 6
     if any(term in normalized_text for term in ["delivery", "ownership", "impact", "collaboration"]):
         score += 4
@@ -388,14 +538,17 @@ def _build_resume_analysis(candidate: dict[str, Any], latest_upload: dict[str, A
 
     summary_parts = [
         f"Resume analysis for {candidate.get('full_name', 'the candidate')}.",
-        f"The resume suggests a {inferred_level.lower()} profile aligned to {candidate_role or 'general'} work.",
+        f"The resume suggests a {inferred_level.lower()} profile aligned to {resolved_interview_role} work.",
         f"Key skills detected: {', '.join(matched_skills[:5])}.",
+        f"Role source used: {resolved_role_source}.",
     ]
     if top_terms:
         summary_parts.append(f"Frequent terms include {', '.join(top_terms[:3])}.")
 
     if not extracted_text:
-        summary_parts.append(f"Text extraction from {file_name} was limited, so the summary is based on the uploaded file metadata and candidate role.")
+        summary_parts.append(
+            f"Text extraction from {file_name} was limited, so role alignment used the fallback order with {resolved_interview_role}."
+        )
 
     return {
         "ai_summary": " ".join(summary_parts),
@@ -416,18 +569,29 @@ def _persist_candidate_analysis(candidate_id: str, analysis: dict[str, Any]) -> 
     )
 
 
-def _candidate_detail_payload(candidate: dict[str, Any], latest_upload: dict[str, Any] | None, slots: list[dict[str, Any]]) -> dict[str, Any]:
+def _candidate_detail_payload(
+    candidate: dict[str, Any],
+    latest_upload: dict[str, Any] | None,
+    slots: list[dict[str, Any]],
+    inferred_role: str | None = None,
+) -> dict[str, Any]:
     analysis_summary = candidate.get("ai_summary")
     analysis_score = candidate.get("ai_score")
     analysis_skills = candidate.get("ai_skills") or []
     analysis_level = candidate.get("ai_experience_level") or "Mid level"
     analysis_transcript = candidate.get("ai_transcript") or analysis_summary
+    interview_role, role_source = _resolve_interview_role(candidate, inferred_role)
 
     return {
         "candidate": {
             "id": candidate["id"],
             "name": candidate.get("full_name", "Candidate"),
-            "position": candidate.get("role", "candidate"),
+            "position": interview_role,
+            "authRole": candidate.get("role", "candidate"),
+            "targetRole": candidate.get("target_role"),
+            "adminOverrideRole": candidate.get("admin_override_role"),
+            "interviewRole": interview_role,
+            "interviewRoleSource": role_source,
             "stage": candidate.get("current_stage", "profile_pending"),
             "score": analysis_score if isinstance(analysis_score, int) else 70 + min((len(slots) if isinstance(slots, list) else 0) * 5, 25),
             "aiSummary": analysis_summary,
@@ -474,10 +638,23 @@ def candidate_dashboard(request_obj: Request) -> dict[str, Any]:
     )
 
     latest_upload = uploads[0] if isinstance(uploads, list) and uploads else None
+    inferred_role = None
+    if latest_upload and latest_upload.get("file_url"):
+        try:
+            extracted_text = _extract_pdf_text(_download_url_bytes(latest_upload["file_url"]))
+            inferred_role = _infer_interview_role_from_resume_text(extracted_text)
+        except Exception:
+            inferred_role = None
+    interview_role, role_source = _resolve_interview_role(candidate, inferred_role)
     booked_slots = [slot for slot in slots if slot.get("status") == "booked"] if isinstance(slots, list) else []
 
     return {
         "candidate": candidate,
+        "authRole": candidate.get("role", "candidate"),
+        "targetRole": candidate.get("target_role"),
+        "adminOverrideRole": candidate.get("admin_override_role"),
+        "interviewRole": interview_role,
+        "interviewRoleSource": role_source,
         "stats": {
             "profileCreated": True,
             "resumeUploaded": latest_upload is not None,
@@ -502,10 +679,12 @@ def candidate_interview_slots(request_obj: Request) -> dict[str, Any]:
     )
 
     latest_started = slots[0] if isinstance(slots, list) and slots else None
+    interview_role, _ = _resolve_interview_role(candidate)
 
     return {
         "slots": slots if isinstance(slots, list) else [],
         "latestStarted": latest_started,
+        "interviewPlan": _build_role_specific_interview_plan(interview_role),
     }
 
 
@@ -528,8 +707,34 @@ def candidate_interview_slots_create(request_obj: Request, payload: InterviewSlo
         use_service_role=True,
     )
 
+    uploads = _supabase_request(
+        f"/rest/v1/profile_uploads?candidate_id=eq.{quote(candidate['id'])}&select=*&order=created_at.desc&limit=1",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+    latest_upload = uploads[0] if isinstance(uploads, list) and uploads else None
+
+    inferred_role = None
+    if latest_upload and latest_upload.get("file_url"):
+        try:
+            extracted_text = _extract_pdf_text(_download_url_bytes(latest_upload["file_url"]))
+            inferred_role = _infer_interview_role_from_resume_text(extracted_text)
+        except Exception:
+            inferred_role = None
+
+    interview_role, role_source = _resolve_interview_role(candidate, inferred_role)
+    interview_plan = _build_role_specific_interview_plan(interview_role)
+
     created = created_rows[0] if isinstance(created_rows, list) else created_rows
-    return {"message": "Interview started", "startedAt": started_at, "slot": created}
+    return {
+        "message": "Interview started",
+        "startedAt": started_at,
+        "slot": created,
+        "interviewRole": interview_role,
+        "interviewRoleSource": role_source,
+        "interviewPlan": interview_plan,
+    }
 
 
 @router.post("/candidate/profile-upload")
@@ -556,11 +761,23 @@ def candidate_profile_upload(request_obj: Request, payload: ProfileUploadPayload
         use_service_role=True,
     )
 
+    target_role = _normalize_role_value(payload.targetRole)
+    if target_role:
+        _supabase_request(
+            f"/rest/v1/candidates?id=eq.{quote(candidate['id'])}",
+            method="PATCH",
+            body={"target_role": target_role},
+            bearer_token=settings.supabase_service_role_key,
+            use_service_role=True,
+        )
+        candidate["target_role"] = target_role
+
     uploaded = uploaded_rows[0] if isinstance(uploaded_rows, list) else uploaded_rows
 
     return {
         "message": "Profile upload saved to Supabase",
         "candidate": candidate,
+        "interviewRole": _resolve_interview_role(candidate)[0],
         "upload": uploaded,
         "receivedAt": datetime.now(UTC).isoformat(),
         "submittedAt": payload.submittedAt,
@@ -621,11 +838,16 @@ def admin_candidates(request_obj: Request) -> dict[str, Any]:
         candidate_uploads = uploads_by_candidate.get(candidate["id"], [])
         latest_upload = candidate_uploads[0] if candidate_uploads else None
         ai_score = candidate.get("ai_score")
+        interview_role, role_source = _resolve_interview_role(candidate)
         response_candidates.append(
             {
                 "id": candidate["id"],
                 "name": candidate.get("full_name", "Candidate"),
-                "role": candidate.get("role", "candidate"),
+                "role": interview_role,
+                "authRole": candidate.get("role", "candidate"),
+                "targetRole": candidate.get("target_role"),
+                "adminOverrideRole": candidate.get("admin_override_role"),
+                "interviewRoleSource": role_source,
                 "stage": candidate.get("current_stage", "profile_pending"),
                 "score": ai_score if isinstance(ai_score, int) else 70 + min(len(candidate_uploads) * 5, 25),
                 "latestUpload": latest_upload,
@@ -667,12 +889,80 @@ def admin_candidate_details(request_obj: Request, candidate_id: str) -> dict[str
     )
 
     latest_upload = uploads[0] if isinstance(uploads, list) and uploads else None
+    inferred_role = None
+    if latest_upload and latest_upload.get("file_url"):
+        try:
+            extracted_text = _extract_pdf_text(_download_url_bytes(latest_upload["file_url"]))
+            inferred_role = _infer_interview_role_from_resume_text(extracted_text)
+        except Exception:
+            inferred_role = None
+
     if latest_upload and not candidate.get("ai_summary"):
         analysis = _build_resume_analysis(candidate, latest_upload)
         _persist_candidate_analysis(candidate["id"], analysis)
         candidate = {**candidate, **analysis}
 
-    return _candidate_detail_payload(candidate, latest_upload, slots if isinstance(slots, list) else [])
+    return _candidate_detail_payload(candidate, latest_upload, slots if isinstance(slots, list) else [], inferred_role)
+
+
+@router.patch("/admin/candidates/{candidate_id}/interview-role")
+def admin_update_candidate_interview_role(
+    request_obj: Request,
+    candidate_id: str,
+    payload: AdminInterviewRolePayload,
+) -> dict[str, Any]:
+    access_token = _get_bearer_token(request_obj)
+    user = _get_supabase_user(access_token)
+    if not _is_admin(user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+
+    candidate_rows = _supabase_request(
+        f"/rest/v1/candidates?id=eq.{quote(candidate_id)}&select=*",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+
+    if not candidate_rows:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Candidate not found")
+
+    target_role = _normalize_role_value(payload.targetRole)
+    admin_override_role = _normalize_role_value(payload.adminOverrideRole)
+
+    _supabase_request(
+        f"/rest/v1/candidates?id=eq.{quote(candidate_id)}",
+        method="PATCH",
+        body={
+            "target_role": target_role,
+            "admin_override_role": admin_override_role,
+        },
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+
+    refreshed_rows = _supabase_request(
+        f"/rest/v1/candidates?id=eq.{quote(candidate_id)}&select=*",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+    refreshed_candidate = refreshed_rows[0] if isinstance(refreshed_rows, list) else refreshed_rows
+
+    uploads = _supabase_request(
+        f"/rest/v1/profile_uploads?candidate_id=eq.{quote(candidate_id)}&select=*&order=created_at.desc",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+    slots = _supabase_request(
+        f"/rest/v1/interview_slots?candidate_id=eq.{quote(candidate_id)}&select=*&order=slot_time.asc",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+    latest_upload = uploads[0] if isinstance(uploads, list) and uploads else None
+
+    return _candidate_detail_payload(refreshed_candidate, latest_upload, slots if isinstance(slots, list) else [])
 
 
 @router.post("/admin/analyze-resume/{candidate_id}")

@@ -8,16 +8,19 @@ The current implementation includes:
 - A Supabase schema migration with RLS policies for candidate data
 - Resume upload, interview start, and admin review flows
 - AI resume summarization support in the admin detail view
+- Interview role routing with candidate input, admin override, and fallback inference
 
 ## What Is Working Now
 
 - Candidate login and signup through Supabase auth
 - Role-aware routing for candidate and admin views
-- Resume upload flow from the frontend to the backend
+- Resume upload flow from the frontend to Supabase Storage with backend metadata persistence
 - Backend verification of the Supabase access token
-- Supabase-backed insert flow for candidate upload records
+- Supabase-backed insert flow for candidate upload records and interview role data
 - Live server-synced interview start timing
 - Admin candidate detail analysis with extracted skills and summary
+- Resolved interview role fallback: admin override -> candidate target role -> resume inference
+- Role-specific interview flow and starter question set for candidates
 
 ## Project Layout
 
@@ -38,11 +41,12 @@ JARVIS/
 - Role-based protected routes for `candidate` and `admin`
 - Candidate pages:
   - Dashboard
-  - Profile upload with PDF validation
-  - Interview start screen
+  - Profile upload with PDF validation and target interview role text input
+  - Interview start screen with role-specific plan/questions
 - Admin pages:
   - Candidate dashboard with search
   - Candidate detail view with resume and AI summary cards
+  - Interview role controls (target role and admin override)
 - UI polish with Tailwind CSS, Framer Motion, and toast notifications
 
 ### Backend
@@ -52,7 +56,9 @@ JARVIS/
 - `GET /time` for server UTC sync
 - `POST /candidate/profile-upload` persists upload metadata in Supabase
 - `POST /candidate/storage/signed-upload` creates storage signed upload URLs
+- `POST /candidate/interview-slots` starts interview and returns role-based interview plan
 - `POST /admin/analyze-resume/{candidate_id}` generates and stores resume analysis
+- `PATCH /admin/candidates/{candidate_id}/interview-role` saves target/override interview role
 - Backend config supports Supabase URL, anon key, service role key, and database URL
 
 ### Supabase
@@ -61,6 +67,9 @@ JARVIS/
   - `candidates`
   - `profile_uploads`
   - `interview_slots`
+- `candidates` includes dedicated interview role fields:
+  - `target_role`
+  - `admin_override_role`
 - Row-level security is enabled for all three tables
 - Candidate policies restrict access to the authenticated user
 - Storage policies scope resume files to the authenticated user folder
@@ -85,7 +94,7 @@ python -m venv .venv
 .\.venv\Scripts\activate
 pip install -r requirements.txt
 copy .env.example .env
-uvicorn run:app --reload --port 8000
+python -m uvicorn app.main:app --reload --port 8000
 ```
 
 Backend URL: `http://localhost:8000`
@@ -144,7 +153,7 @@ GET /rest/v1/candidates?select=*
 
 ## Next Steps
 
-- Add storage upload verification for PDFs in Supabase Storage
-- Add real AI provider integration for resume summarization
-- Add real data fetching in the dashboard pages
-- Add automated tests for the backend route and frontend flows
+- Phase 8: add video interview recording and storage playback
+- Add stage-management APIs and richer admin filters
+- Add automated tests for backend and frontend critical flows
+- Add deployment docs and CI/CD pipeline

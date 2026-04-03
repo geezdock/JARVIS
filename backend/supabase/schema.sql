@@ -8,6 +8,8 @@ create table if not exists public.candidates (
   user_id uuid not null unique,
   full_name text not null,
   role text not null default 'candidate',
+  target_role text,
+  admin_override_role text,
   current_stage text not null default 'profile_pending',
   ai_summary text,
   ai_score integer,
@@ -18,6 +20,12 @@ create table if not exists public.candidates (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+alter table public.candidates
+  add column if not exists target_role text;
+
+alter table public.candidates
+  add column if not exists admin_override_role text;
 
 create table if not exists public.profile_uploads (
   id uuid primary key default gen_random_uuid(),

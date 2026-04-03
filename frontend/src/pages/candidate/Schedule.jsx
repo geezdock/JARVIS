@@ -12,8 +12,27 @@ export default function Schedule() {
   const [currentTime, setCurrentTime] = useState(() => new Date());
   const [timeOffsetMs, setTimeOffsetMs] = useState(0);
   const [startedAt, setStartedAt] = useState(null);
+  const [interviewRole, setInterviewRole] = useState('General Candidate');
+  const [interviewPlan, setInterviewPlan] = useState(null);
 
   useEffect(() => {
+    const fetchInterviewContext = async () => {
+      try {
+        const response = await api.get('/candidate/interview-slots');
+        const latest = response.data?.latestStarted;
+        const plan = response.data?.interviewPlan;
+        if (latest?.slot_time) {
+          setStartedAt(latest.slot_time);
+        }
+        if (plan) {
+          setInterviewPlan(plan);
+          setInterviewRole(plan.role || 'General Candidate');
+        }
+      } catch (_error) {
+        setInterviewPlan(null);
+      }
+    };
+
     const fetchServerTime = async () => {
       try {
         const response = await api.get('/time');
@@ -26,6 +45,7 @@ export default function Schedule() {
       }
     };
 
+    fetchInterviewContext();
     fetchServerTime();
   }, []);
 
@@ -44,6 +64,8 @@ export default function Schedule() {
         slotTime: new Date().toISOString(),
       });
       setStartedAt(response.data?.startedAt ?? response.data?.slot?.slot_time ?? null);
+      setInterviewRole(response.data?.interviewRole || 'General Candidate');
+      setInterviewPlan(response.data?.interviewPlan ?? null);
       toast.success('Interview started');
     } catch (_error) {
       toast.error('Unable to start interview right now');
@@ -84,6 +106,14 @@ export default function Schedule() {
           Once you click Start Interview, your session will be marked as active and saved to your timeline.
         </div>
 
+        <div className="mt-4 rounded-xl border border-indigo-100 bg-indigo-50 p-4 text-sm text-indigo-900">
+          <p className="text-xs font-semibold uppercase tracking-wide">Interview role</p>
+          <p className="mt-1 font-semibold">{interviewRole}</p>
+          {interviewPlan?.flow?.length > 0 && (
+            <p className="mt-1 text-xs text-indigo-700">Flow: {interviewPlan.flow.join(' -> ')}</p>
+          )}
+        </div>
+
         <div className="mt-4 rounded-xl border border-teal-100 bg-white p-4 text-sm text-slate-700">
           <p className="text-xs font-semibold uppercase tracking-wide text-teal-800">Current server time</p>
           <p className="mt-1 font-medium text-slate-900">{currentTime.toLocaleString()}</p>
@@ -97,6 +127,17 @@ export default function Schedule() {
           <div className="mt-5 rounded-xl border border-teal-200 bg-teal-50 p-4">
             <p className="text-sm font-semibold text-teal-900">Interview Started At</p>
             <p className="mt-2 text-sm text-teal-800">{formatUtcTime(startedAt)}</p>
+
+            {interviewPlan?.questions?.length > 0 && (
+              <div className="mt-4 rounded-lg border border-white/70 bg-white/70 p-3">
+                <p className="text-sm font-semibold text-teal-900">Role-based questions</p>
+                <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-teal-800">
+                  {interviewPlan.questions.map((question) => (
+                    <li key={question}>{question}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
           </div>
         )}
       </Card>

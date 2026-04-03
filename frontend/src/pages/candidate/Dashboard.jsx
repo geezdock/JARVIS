@@ -9,7 +9,7 @@ import Card from '../../components/ui/Card';
 import api from '../../lib/axios';
 
 export default function CandidateDashboard() {
-  const { user } = useAuth();
+  const { user, displayName } = useAuth();
   const [loading, setLoading] = useState(true);
   const [dashboard, setDashboard] = useState(null);
 
@@ -50,7 +50,10 @@ export default function CandidateDashboard() {
       <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }}>
         <h1 className="text-3xl font-black tracking-tight text-slate-900">Candidate Dashboard</h1>
         <p className="mt-2 text-slate-600">
-          Welcome {user?.email}. Track your hiring pipeline status below.
+          Welcome {displayName || user?.email}. Track your hiring pipeline status below.
+        </p>
+        <p className="mt-1 text-sm text-slate-500">
+          Interview role: <span className="font-semibold text-slate-700">{dashboard?.interviewRole || 'General Candidate'}</span>
         </p>
       </motion.div>
 
