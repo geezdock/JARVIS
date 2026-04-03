@@ -131,35 +131,35 @@ All endpoints built and Supabase-integrated:
 
 ---
 
-### Phase 8: Video Interview Recording [55% - IN PROGRESS]
+### Phase 8: Video Interview Recording [80% - IN PROGRESS]
 
 **Goal:** Enable candidates to record video interviews during scheduled slots.
 
 #### 8.1 Choose Video Solution
-- [ ] Evaluate: Twilio Video, Daily.co, Whereby, or browser WebRTC with recording
-- [ ] Decide: Live vs recorded, moderation requirements
+- [x] Evaluate: Twilio Video, Daily.co, Whereby, or browser WebRTC with recording
+- [x] Decide: live browser-based interview room with consent-gated capture and private storage
 
 #### 8.2 Create Interview Recording Page
-- [ ] Create new component [frontend/src/pages/candidate/Interview.jsx](frontend/src/pages/candidate/Interview.jsx)
+- [x] Create new component [frontend/src/pages/candidate/Interview.jsx](frontend/src/pages/candidate/Interview.jsx)
 - [ ] Implement:
-  - Camera/microphone permission request
-  - Recording UI with start/stop buttons
-  - Video preview during recording
-  - Upload to Storage after recording
-- [ ] Add route to candidate router pointing to this page
+  - [x] Camera/microphone permission request
+  - [x] Recording UI with start/stop buttons
+  - [x] Video preview during recording
+  - [x] Upload to Storage after recording
+- [x] Add route to candidate router pointing to this page
 
 #### 8.3 Build Backend Interview Endpoint
-- [ ] Create `POST /candidate/interview-upload` endpoint to:
-  - Accept video file and interview metadata
-  - Validate interview slot timing
-  - Store video file in Storage bucket
-  - Update interview_slots.status to "completed"
-  - Trigger transcription/analysis if needed
+- [x] Create interview session endpoints to:
+  - [x] Accept interview metadata and consent state
+  - [x] Validate interview session ownership and application stage
+  - [x] Store media in private Storage bucket via signed upload URLs
+  - [x] Update `interview_sessions.status` and `interview_slots.status`
+  - [x] Persist transcript / score payload for later analysis
 
 #### 8.4 Admin Interview Playback
 - [ ] Update [frontend/src/pages/admin/CandidateDetails.jsx](frontend/src/pages/admin/CandidateDetails.jsx) to:
-  - Display video player for completed interviews
-  - Show transcription/summary if available
+  - [ ] Display video player for completed interviews
+  - [ ] Show transcription/summary if available
 
 **Dependencies:** Phase 6 (File Storage), Phase 7 (AI Analysis optional)
 
@@ -176,6 +176,10 @@ All endpoints built and Supabase-integrated:
 - [x] Interview session schema added (`interview_sessions`, `interview_artifacts`) and `interview-media` bucket policies
 - [x] Session creation is consent-gated and limited to one session per application stage
 - [x] Interview media is stored privately with signed upload/read access
+- [x] Session resume is verified against the backend before reusing interview context
+- [x] Admin access checks use trusted Supabase metadata only
+- [x] Signed interview upload nonces are validated and consumed through shared storage, not process memory
+- [x] Expired artifacts can be recorded and cleaned up with audit logging
 - [ ] Wire full OpenAI Realtime media stream in browser (current room uses role-based scripted AI voice prompts and browser capture)
 - [ ] Add admin playback UI for saved interview artifacts
 - [ ] Finalize session scoring rubric and transcript enrichment
@@ -329,6 +333,6 @@ npm run dev
 - All backend routes include proper error handling and token validation
 - Automatic candidate record creation prevents orphaned data
 - Admin routes check `_is_admin()` before returning data
-- Frontend auto-detects admin role from email (contains "admin") or user_metadata.role
+- Frontend routes candidates to the interview room after session bootstrap; admin access is enforced server-side through trusted metadata
 - CORS is configured for frontend origin in [backend/app/main.py](backend/app/main.py)
 - Session bootstrap ensures user is logged in before rendering protected pages

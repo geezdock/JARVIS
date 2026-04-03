@@ -196,6 +196,19 @@ create table if not exists public.interview_artifact_deletion_log (
   deleted_at timestamptz not null default now()
 );
 
+create table if not exists public.interview_upload_nonces (
+  id text primary key,
+  candidate_id uuid not null references public.candidates(id) on delete cascade,
+  session_id uuid not null references public.interview_sessions(id) on delete cascade,
+  user_id uuid not null,
+  file_type text not null,
+  path text not null,
+  used boolean not null default false,
+  used_at timestamptz,
+  expires_at timestamptz not null,
+  created_at timestamptz not null default now()
+);
+
 insert into storage.buckets (id, name, public)
 values ('resumes', 'resumes', true)
 on conflict (id) do update
@@ -214,6 +227,7 @@ alter table public.interview_slots enable row level security;
 alter table public.interview_sessions enable row level security;
 alter table public.interview_artifacts enable row level security;
 alter table public.interview_artifact_deletion_log enable row level security;
+alter table public.interview_upload_nonces enable row level security;
 
 drop policy if exists "candidate can read own candidate row" on public.candidates;
 create policy "candidate can read own candidate row"
@@ -226,12 +240,6 @@ create policy "candidate can insert own candidate row"
 on public.candidates
 for insert
 with check (auth.uid() = user_id);
-
-drop policy if exists "candidate can update own candidate row" on public.candidates;
-create policy "candidate can update own candidate row"
-on public.candidates
-for update
-using (auth.uid() = user_id);
 
 drop policy if exists "candidate can read own uploads" on public.profile_uploads;
 create policy "candidate can read own uploads"
@@ -312,7 +320,10 @@ create policy "authenticated users can read resumes"
 on storage.objects
 for select
 to authenticated
-using (bucket_id = 'resumes');
+using (
+  bucket_id = 'resumes'
+  and split_part(name, '/', 1) = auth.uid()::text
+);
 
 drop policy if exists "authenticated users can update own resumes" on storage.objects;
 create policy "authenticated users can update own resumes"

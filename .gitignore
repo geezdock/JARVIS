@@ -27,3 +27,8 @@ frontend/dist/
 # OS cruft
 .DS_Store
 Thumbs.db
+
+# Local security analysis docs
+SECURITY_ANALYSIS_PHASE8.md
+SECURITY_FIX_CONSENTS.md
+SECURITY_FIX_PHASE8.md

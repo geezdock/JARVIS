@@ -1,4 +1,4 @@
-from datetime import datetime, UTC
+from datetime import datetime, UTC, timedelta
 import io
 import json
 import re
@@ -17,15 +17,6 @@ from pypdf import PdfReader
 from app.config import settings
 
 router = APIRouter()
-
-# Server-side cache for OpenAI Realtime session tokens
-# Maps session_id -> {token data with client_secret, expires_at}
-# This prevents exposing client_secret to the frontend
-_REALTIME_SESSIONS: dict[str, dict[str, Any]] = {}
-
-# Single-use upload nonces for interview media uploads.
-# Maps nonce -> {session_id, candidate_id, user_id, file_type, path, used, expires_at}
-_INTERVIEW_UPLOAD_NONCES: dict[str, dict[str, Any]] = {}
 
 
 class ProfileUploadPayload(BaseModel):
@@ -299,9 +290,8 @@ def _candidate_name_from_user(user: dict[str, Any]) -> str:
 
 
 def _is_admin(user: dict[str, Any]) -> bool:
-    metadata_role = (user.get("user_metadata") or {}).get("role")
     app_metadata_role = (user.get("app_metadata") or {}).get("role")
-    return metadata_role == "admin" or app_metadata_role == "admin"
+    return app_metadata_role == "admin"
 
 
 def _get_or_create_candidate(user: dict[str, Any]) -> dict[str, Any]:
@@ -416,6 +406,89 @@ def _delete_storage_object(path: str, bucket_id: str) -> None:
         if "not found" in str(exc).lower() or "404" in str(exc):
             return
         raise
+
+
+def _parse_utc_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _revoke_interview_upload_nonces(candidate_id: str, session_id: str, file_type: str) -> None:
+    nonce_rows = _supabase_request(
+        f"/rest/v1/interview_upload_nonces?candidate_id=eq.{quote(candidate_id)}&session_id=eq.{quote(session_id)}&file_type=eq.{quote(file_type)}&used=eq.false&select=*",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+
+    for nonce_row in nonce_rows if isinstance(nonce_rows, list) else []:
+        nonce_id = nonce_row.get("id")
+        if not nonce_id:
+            continue
+        _supabase_request(
+            f"/rest/v1/interview_upload_nonces?id=eq.{quote(str(nonce_id))}",
+            method="DELETE",
+            bearer_token=settings.supabase_service_role_key,
+            use_service_role=True,
+        )
+
+
+def _get_interview_upload_nonce(nonce_id: str, candidate_id: str, session_id: str, file_type: str) -> dict[str, Any] | None:
+    nonce_rows = _supabase_request(
+        f"/rest/v1/interview_upload_nonces?id=eq.{quote(nonce_id)}&candidate_id=eq.{quote(candidate_id)}&session_id=eq.{quote(session_id)}&file_type=eq.{quote(file_type)}&select=*",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+    if not nonce_rows:
+        return None
+    return nonce_rows[0] if isinstance(nonce_rows, list) else nonce_rows
+
+
+def _mark_interview_upload_nonce_used(nonce_id: str) -> None:
+    _supabase_request(
+        f"/rest/v1/interview_upload_nonces?id=eq.{quote(nonce_id)}",
+        method="PATCH",
+        body={
+            "used": True,
+            "used_at": datetime.now(UTC).isoformat(),
+        },
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+
+
+def _delete_interview_upload_nonces_for_session(session_id: str, candidate_id: str | None = None) -> None:
+    query = f"/rest/v1/interview_upload_nonces?session_id=eq.{quote(session_id)}&select=*"
+    if candidate_id:
+        query = f"/rest/v1/interview_upload_nonces?session_id=eq.{quote(session_id)}&candidate_id=eq.{quote(candidate_id)}&select=*"
+
+    nonce_rows = _supabase_request(
+        query,
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+
+    for nonce_row in nonce_rows if isinstance(nonce_rows, list) else []:
+        nonce_id = nonce_row.get("id")
+        if not nonce_id:
+            continue
+        _supabase_request(
+            f"/rest/v1/interview_upload_nonces?id=eq.{quote(str(nonce_id))}",
+            method="DELETE",
+            bearer_token=settings.supabase_service_role_key,
+            use_service_role=True,
+        )
 
 
 def _build_storage_signed_upload_url(path: str, bucket_id: str = "resumes", is_public: bool = True) -> dict[str, str]:
@@ -994,19 +1067,6 @@ def candidate_interview_session_start(
     existing_session = existing_sessions[0] if isinstance(existing_sessions, list) and existing_sessions else None
     if existing_session:
         if existing_session.get("status") == "in_progress":
-            existing_session_id = existing_session.get("id")
-            realtime_public = None
-            
-            # Check if we have a cached realtime session for this interview
-            if existing_session_id and existing_session_id in _REALTIME_SESSIONS:
-                cached = _REALTIME_SESSIONS[existing_session_id]
-                realtime_public = {
-                    "id": cached.get("id"),
-                    "model": cached.get("model"),
-                    "expires_at": cached.get("expires_at"),
-                    # client_secret omitted
-                }
-            
             return {
                 "message": "Interview session already in progress",
                 "session": existing_session,
@@ -1017,7 +1077,7 @@ def candidate_interview_session_start(
                     existing_session.get("interview_role") or _resolve_interview_role(candidate)[0]
                 ),
                 "resumeSummary": candidate.get("ai_summary") or "Resume summary pending. Ask structured role-fit questions.",
-                "realtime": realtime_public,
+                "realtime": None,
             }
 
         raise HTTPException(
@@ -1080,14 +1140,7 @@ def candidate_interview_session_start(
 
     resume_summary = candidate.get("ai_summary") or "Resume summary pending. Ask structured role-fit questions."
     realtime_response = _create_openai_realtime_session(interview_role, interview_plan, resume_summary)
-    
-    # SECURITY: Store realtime session token server-side; only return public metadata
-    if realtime_response and session and isinstance(session, dict):
-        session_id = session.get("id")
-        if session_id:
-            # Store the full response (including client_secret) server-side
-            _REALTIME_SESSIONS[session_id] = realtime_response
-    
+
     # Return only public fields; client_secret stays server-side
     realtime_public = None
     if realtime_response:
@@ -1195,15 +1248,14 @@ def candidate_interview_session_complete(
                 detail="Missing upload nonce for video artifact",
             )
 
-        nonce_payload = _INTERVIEW_UPLOAD_NONCES.get(payload.videoUploadNonce)
-        now_ts = time.time()
+        nonce_payload = _get_interview_upload_nonce(payload.videoUploadNonce, candidate["id"], session_id, "video")
+        now_dt = datetime.now(UTC)
+        expires_at = _parse_utc_datetime((nonce_payload or {}).get("expires_at"))
         if (
             not isinstance(nonce_payload, dict)
             or nonce_payload.get("used")
-            or nonce_payload.get("expires_at", 0) < now_ts
-            or nonce_payload.get("candidate_id") != candidate.get("id")
-            or nonce_payload.get("session_id") != session_id
-            or nonce_payload.get("file_type") != "video"
+            or not expires_at
+            or expires_at < now_dt
             or nonce_payload.get("path") != payload.videoPath
         ):
             raise HTTPException(
@@ -1211,7 +1263,7 @@ def candidate_interview_session_complete(
                 detail="Invalid or expired upload nonce for video artifact",
             )
 
-        nonce_payload["used"] = True
+        _mark_interview_upload_nonce_used(payload.videoUploadNonce)
 
     if payload.audioPath:
         if not payload.audioUploadNonce:
@@ -1220,15 +1272,14 @@ def candidate_interview_session_complete(
                 detail="Missing upload nonce for audio artifact",
             )
 
-        audio_nonce_payload = _INTERVIEW_UPLOAD_NONCES.get(payload.audioUploadNonce)
-        now_ts = time.time()
+        audio_nonce_payload = _get_interview_upload_nonce(payload.audioUploadNonce, candidate["id"], session_id, "audio")
+        now_dt = datetime.now(UTC)
+        audio_expires_at = _parse_utc_datetime((audio_nonce_payload or {}).get("expires_at"))
         if (
             not isinstance(audio_nonce_payload, dict)
             or audio_nonce_payload.get("used")
-            or audio_nonce_payload.get("expires_at", 0) < now_ts
-            or audio_nonce_payload.get("candidate_id") != candidate.get("id")
-            or audio_nonce_payload.get("session_id") != session_id
-            or audio_nonce_payload.get("file_type") != "audio"
+            or not audio_expires_at
+            or audio_expires_at < now_dt
             or audio_nonce_payload.get("path") != payload.audioPath
         ):
             raise HTTPException(
@@ -1236,7 +1287,7 @@ def candidate_interview_session_complete(
                 detail="Invalid or expired upload nonce for audio artifact",
             )
 
-        audio_nonce_payload["used"] = True
+        _mark_interview_upload_nonce_used(payload.audioUploadNonce)
     
     ended_at = datetime.now(UTC).isoformat()
     duration_seconds = payload.durationSeconds if isinstance(payload.durationSeconds, int) else None
@@ -1297,14 +1348,8 @@ def candidate_interview_session_complete(
             detail="Interview completed but artifact could not be loaded",
         )
 
-    # Best-effort cleanup of any remaining nonce entries for this session
-    stale_nonce_keys = [
-        key
-        for key, value in _INTERVIEW_UPLOAD_NONCES.items()
-        if isinstance(value, dict) and value.get("session_id") == session_id
-    ]
-    for key in stale_nonce_keys:
-        _INTERVIEW_UPLOAD_NONCES.pop(key, None)
+    # Best-effort cleanup of any remaining nonce rows for this session
+    _delete_interview_upload_nonces_for_session(session_id, candidate.get("id"))
 
     return {
         "message": "Interview session completed",
@@ -1447,30 +1492,28 @@ def candidate_storage_signed_interview_upload(request_obj: Request, payload: Sig
     storage_path = f"{user_id}/{session_id}/{file_type}-{timestamp}.{extension}"
 
     # Revoke prior unused nonces for this exact session/file_type pair
-    for nonce_key, nonce_value in list(_INTERVIEW_UPLOAD_NONCES.items()):
-        if not isinstance(nonce_value, dict):
-            continue
-        if (
-            nonce_value.get("session_id") == session_id
-            and nonce_value.get("candidate_id") == candidate.get("id")
-            and nonce_value.get("file_type") == file_type
-            and not nonce_value.get("used")
-        ):
-            _INTERVIEW_UPLOAD_NONCES.pop(nonce_key, None)
+    _revoke_interview_upload_nonces(candidate["id"], session_id, file_type)
 
     try:
         signed = _build_storage_signed_upload_url(storage_path, bucket_id="interview-media", is_public=False)
 
         upload_nonce = secrets.token_urlsafe(32)
-        _INTERVIEW_UPLOAD_NONCES[upload_nonce] = {
-            "session_id": session_id,
-            "candidate_id": candidate.get("id"),
-            "user_id": user_id,
-            "file_type": file_type,
-            "path": storage_path,
-            "used": False,
-            "expires_at": time.time() + 300,
-        }
+        _supabase_request(
+            "/rest/v1/interview_upload_nonces?select=*",
+            method="POST",
+            body={
+                "id": upload_nonce,
+                "candidate_id": candidate["id"],
+                "session_id": session_id,
+                "user_id": user_id,
+                "file_type": file_type,
+                "path": storage_path,
+                "used": False,
+                "expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+            },
+            bearer_token=settings.supabase_service_role_key,
+            use_service_role=True,
+        )
 
         return {
             **signed,
