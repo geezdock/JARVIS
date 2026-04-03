@@ -14,7 +14,7 @@
 
 - GET /            -> basic API message
 - GET /health      -> health check
-- POST /candidate/profile-upload -> mock profile upload
+- POST /candidate/profile-upload -> saves upload metadata in Supabase
 
 ## Frontend Integration
 
@@ -24,5 +24,18 @@ Your frontend axios base URL is configured via:
 The frontend currently posts to:
 - /candidate/profile-upload
 
-The backend route is exposed at:
-- /candidate/profile-upload
+The backend route validates the Supabase bearer token, resolves the user, and inserts into Supabase tables.
+
+## Supabase Schema
+
+Apply the migration in:
+- supabase/schema.sql
+
+## Backend Environment
+
+Use `backend/.env.example` as the source of truth for backend-only values, including:
+
+- SUPABASE_URL
+- SUPABASE_ANON_KEY
+- SUPABASE_SERVICE_ROLE_KEY
+- SUPABASE_DB_URL

@@ -1,26 +1,70 @@
 import React from 'react';
-import { useMemo } from 'react';
+import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { motion } from 'framer-motion';
-import { ChevronLeft, FileText, MicVocal, Sparkle } from 'lucide-react';
+import { ChevronLeft, FileText, MicVocal, Sparkle, WandSparkles } from 'lucide-react';
+import toast from 'react-hot-toast';
 import Card from '../../components/ui/Card';
+import Button from '../../components/ui/Button';
+import api from '../../lib/axios';
 
 export default function CandidateDetails() {
   const { id } = useParams();
+  const [loading, setLoading] = useState(true);
+  const [details, setDetails] = useState(null);
+  const [analyzing, setAnalyzing] = useState(false);
 
-  const candidate = useMemo(
-    () => ({
-      id,
-      name: id === 'c3' ? 'Sara Khan' : 'Aanya Sharma',
-      position: id === 'c3' ? 'ML Engineer' : 'Frontend Engineer',
-      score: id === 'c3' ? 94 : 91,
-      transcript:
-        'Candidate demonstrated strong ownership, clear communication, and practical problem solving with robust trade-off reasoning.',
-      summary:
-        'High confidence in system design, modern frontend patterns, and collaborative debugging workflows.',
-    }),
-    [id],
-  );
+  useEffect(() => {
+    const fetchCandidateDetails = async () => {
+      try {
+        const response = await api.get(`/admin/candidates/${id}`);
+        setDetails(response.data);
+      } catch (_error) {
+        setDetails(null);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchCandidateDetails();
+  }, [id]);
+
+  const onAnalyzeResume = async () => {
+    try {
+      setAnalyzing(true);
+      const response = await api.post(`/admin/analyze-resume/${id}`, { force: true });
+      setDetails(response.data);
+      toast.success('Resume analysis generated');
+    } catch (_error) {
+      toast.error('Unable to analyze resume right now');
+    } finally {
+      setAnalyzing(false);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="flex min-h-[40vh] items-center justify-center text-slate-500">
+        Loading candidate details...
+      </div>
+    );
+  }
+
+  if (!details?.candidate) {
+    return (
+      <div className="space-y-6">
+        <Link to="/admin" className="inline-flex items-center gap-1 text-sm font-medium text-slate-600 hover:text-slate-900">
+          <ChevronLeft size={16} /> Back to dashboard
+        </Link>
+        <p className="text-slate-600">Candidate details are unavailable.</p>
+      </div>
+    );
+  }
+
+  const candidate = details.candidate;
+  const aiSkills = candidate.aiSkills ?? [];
+  const aiSummary = candidate.aiSummary || details.summary;
+  const aiExperienceLevel = candidate.aiExperienceLevel || 'Mid level';
 
   return (
     <div className="space-y-6">
@@ -35,17 +79,46 @@ export default function CandidateDetails() {
 
       <div className="grid gap-4 lg:grid-cols-3">
         <Card className="lg:col-span-2">
-          <div className="mb-4 inline-flex items-center gap-2 text-slate-900">
-            <FileText size={18} className="text-teal-700" />
-            <h2 className="text-lg font-bold">Resume Preview</h2>
+          <div className="mb-4 flex items-center justify-between gap-3 text-slate-900">
+            <div className="inline-flex items-center gap-2">
+              <FileText size={18} className="text-teal-700" />
+              <h2 className="text-lg font-bold">Resume Preview</h2>
+            </div>
+            <Button variant="secondary" size="sm" onClick={onAnalyzeResume} disabled={analyzing} className="gap-1.5">
+              <WandSparkles size={16} /> {analyzing ? 'Analyzing...' : 'Generate AI Summary'}
+            </Button>
           </div>
           <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm leading-6 text-slate-700">
-            <p className="font-semibold">Professional Summary</p>
+            <p className="font-semibold">AI Professional Summary</p>
             <p className="mt-1">
-              Product-minded engineer with 4+ years of experience building high-performance web applications and scalable hiring workflows.
+              {details.latestUpload
+                ? `Latest upload: ${details.latestUpload.file_name} (${details.latestUpload.mime_type}, ${details.latestUpload.file_size} bytes).`
+                : 'No profile upload metadata is available yet for this candidate.'}
             </p>
+            {details.latestUpload?.file_url && (
+              <a
+                href={details.latestUpload.file_url}
+                target="_blank"
+                rel="noreferrer"
+                className="mt-3 inline-flex font-semibold text-teal-700 hover:text-teal-800"
+              >
+                Open stored resume
+              </a>
+            )}
+            <p className="mt-4 font-semibold">AI Experience Level</p>
+            <p className="mt-1">{aiExperienceLevel}</p>
             <p className="mt-4 font-semibold">Key Skills</p>
-            <p className="mt-1">React, TypeScript, ML-assisted analytics, API design, stakeholder communication</p>
+            {aiSkills.length > 0 ? (
+              <div className="mt-2 flex flex-wrap gap-2">
+                {aiSkills.map((skill) => (
+                  <span key={skill} className="rounded-full bg-white px-3 py-1 text-xs font-semibold text-teal-800 ring-1 ring-teal-200">
+                    {skill}
+                  </span>
+                ))}
+              </div>
+            ) : (
+              <p className="mt-1">Data inferred from candidate role, stage, and uploaded profile artifacts.</p>
+            )}
           </div>
         </Card>
 
@@ -64,8 +137,10 @@ export default function CandidateDetails() {
           <MicVocal size={18} className="text-teal-700" />
           <h2 className="text-lg font-bold">AI Interview Transcript Summary</h2>
         </div>
-        <p className="mt-3 text-sm leading-6 text-slate-700">{candidate.transcript}</p>
-        <p className="mt-3 rounded-lg bg-teal-50 p-3 text-sm font-medium text-teal-800">{candidate.summary}</p>
+        <p className="mt-3 text-sm leading-6 text-slate-700">{aiSummary}</p>
+        <p className="mt-3 rounded-lg bg-teal-50 p-3 text-sm font-medium text-teal-800">
+          {details.transcript || 'Resume analysis is generated from the uploaded PDF.'}
+        </p>
       </Card>
     </div>
   );

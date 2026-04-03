@@ -1,20 +1,31 @@
 import React from 'react';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { Search, Star } from 'lucide-react';
 import Card from '../../components/ui/Card';
 import Input from '../../components/ui/Input';
+import api from '../../lib/axios';
 
 export default function AdminDashboard() {
-  const candidates = [
-    { id: 'c1', name: 'Aanya Sharma', role: 'Frontend Engineer', score: 91, stage: 'Interviewed' },
-    { id: 'c2', name: 'Raghav Patel', role: 'Data Engineer', score: 86, stage: 'Resume Screened' },
-    { id: 'c3', name: 'Sara Khan', role: 'ML Engineer', score: 94, stage: 'Interviewed' },
-    { id: 'c4', name: 'Nikhil Roy', role: 'Backend Engineer', score: 82, stage: 'Assessment' },
-  ];
-
+  const [candidates, setCandidates] = useState([]);
+  const [loading, setLoading] = useState(true);
   const [query, setQuery] = useState('');
+
+  useEffect(() => {
+    const fetchCandidates = async () => {
+      try {
+        const response = await api.get('/admin/candidates');
+        setCandidates(response.data?.candidates ?? []);
+      } catch (_error) {
+        setCandidates([]);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchCandidates();
+  }, []);
 
   const filteredCandidates = useMemo(
     () =>
@@ -26,6 +37,14 @@ export default function AdminDashboard() {
   );
 
   const recommendedCandidates = [...candidates].sort((a, b) => b.score - a.score).slice(0, 2);
+
+  if (loading) {
+    return (
+      <div className="flex min-h-[40vh] items-center justify-center text-slate-500">
+        Loading admin dashboard...
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">

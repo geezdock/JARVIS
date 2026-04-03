@@ -1,7 +1,7 @@
 import React from 'react';
 import { Link, NavLink, useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
-import { BriefcaseBusiness, LayoutDashboard, LogOut, Shield, UserRoundCheck } from 'lucide-react';
+import { BriefcaseBusiness, CalendarDays, LayoutDashboard, LogOut, Shield, UserRoundCheck } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { useAuth } from '../../contexts/AuthContext';
 import Button from '../ui/Button';
@@ -58,6 +58,11 @@ export default function Navbar() {
                 <NavLink to="/profile-upload" className={navLinkClass}>
                   <span className="inline-flex items-center gap-1.5">
                     <UserRoundCheck size={16} /> Profile
+                  </span>
+                </NavLink>
+                <NavLink to="/interview" className={navLinkClass}>
+                  <span className="inline-flex items-center gap-1.5">
+                    <CalendarDays size={16} /> Interview
                   </span>
                 </NavLink>
               </>

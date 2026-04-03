@@ -93,13 +93,14 @@ function MainRoutes() {
               }
             />
             <Route
-              path="/schedule"
+              path="/interview"
               element={
               <ProtectedRoute allowedRoles={['candidate']}>
                 <Schedule />
               </ProtectedRoute>
             }
             />
+            <Route path="/schedule" element={<Navigate to="/interview" replace />} />
 
             <Route
               path="/admin"

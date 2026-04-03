@@ -1,19 +1,49 @@
 import React from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { CalendarClock, CircleCheckBig, FileUp, LoaderCircle } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import Button from '../../components/ui/Button';
 import Card from '../../components/ui/Card';
+import api from '../../lib/axios';
 
 export default function CandidateDashboard() {
   const { user } = useAuth();
+  const [loading, setLoading] = useState(true);
+  const [dashboard, setDashboard] = useState(null);
 
-  const progress = [
-    { label: 'Profile Created', done: true, icon: <CircleCheckBig size={16} /> },
-    { label: 'Resume Uploaded', done: false, icon: <FileUp size={16} /> },
-    { label: 'Interview Slot Booked', done: false, icon: <CalendarClock size={16} /> },
-  ];
+  useEffect(() => {
+    const fetchDashboard = async () => {
+      try {
+        const response = await api.get('/candidate/dashboard');
+        setDashboard(response.data);
+      } catch (_error) {
+        setDashboard(null);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchDashboard();
+  }, []);
+
+  const progress = useMemo(
+    () => [
+      { label: 'Profile Created', done: Boolean(dashboard?.stats?.profileCreated), icon: <CircleCheckBig size={16} /> },
+      { label: 'Resume Uploaded', done: Boolean(dashboard?.stats?.resumeUploaded), icon: <FileUp size={16} /> },
+      { label: 'Interview Started', done: Boolean(dashboard?.stats?.interviewBooked), icon: <CalendarClock size={16} /> },
+    ],
+    [dashboard],
+  );
+
+  if (loading) {
+    return (
+      <div className="flex min-h-[40vh] items-center justify-center text-slate-500">
+        Loading candidate dashboard...
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">
@@ -50,14 +80,28 @@ export default function CandidateDashboard() {
       <Card className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h2 className="text-lg font-bold text-slate-900">Next step</h2>
-          <p className="text-sm text-slate-600">Upload your resume PDF and lock an interview slot.</p>
+          <p className="text-sm text-slate-600">
+            {dashboard?.stats?.resumeUploaded
+              ? 'Great progress. Start your interview to complete this stage.'
+              : 'Upload your resume PDF, then start your interview.'}
+          </p>
+          {dashboard?.latestUpload?.file_url && (
+            <a
+              href={dashboard.latestUpload.file_url}
+              target="_blank"
+              rel="noreferrer"
+              className="mt-2 inline-flex text-sm font-semibold text-teal-700 hover:text-teal-800"
+            >
+              View stored resume
+            </a>
+          )}
         </div>
         <div className="flex gap-2">
           <Link to="/profile-upload">
             <Button variant="secondary">Upload Profile</Button>
           </Link>
-          <Link to="/schedule">
-            <Button>Schedule Interview</Button>
+          <Link to="/interview">
+            <Button>Start Interview</Button>
           </Link>
         </div>
       </Card>
