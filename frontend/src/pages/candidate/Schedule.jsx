@@ -1,5 +1,6 @@
 import React from 'react';
 import { useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { CalendarDays } from 'lucide-react';
 import toast from 'react-hot-toast';
@@ -8,6 +9,7 @@ import Card from '../../components/ui/Card';
 import api from '../../lib/axios';
 
 export default function Schedule() {
+  const navigate = useNavigate();
   const [submitting, setSubmitting] = useState(false);
   const [currentTime, setCurrentTime] = useState(() => new Date());
   const [timeOffsetMs, setTimeOffsetMs] = useState(0);
@@ -60,13 +62,8 @@ export default function Schedule() {
   const onStartInterview = async () => {
     try {
       setSubmitting(true);
-      const response = await api.post('/candidate/interview-slots', {
-        slotTime: new Date().toISOString(),
-      });
-      setStartedAt(response.data?.startedAt ?? response.data?.slot?.slot_time ?? null);
-      setInterviewRole(response.data?.interviewRole || 'General Candidate');
-      setInterviewPlan(response.data?.interviewPlan ?? null);
       toast.success('Interview started');
+      navigate('/interview/live');
     } catch (_error) {
       toast.error('Unable to start interview right now');
     } finally {

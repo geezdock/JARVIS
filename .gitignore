@@ -1,7 +1,13 @@
 # Environment files
+.env
+.env.local
+.env.*.local
 backend/.env
 backend/.env.local
 backend/.env.*.local
+frontend/.env
+frontend/.env.local
+frontend/.env.*.local
 
 # Python caches and build artifacts
 backend/__pycache__/

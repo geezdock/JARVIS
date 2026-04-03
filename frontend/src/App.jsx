@@ -12,6 +12,7 @@ import Signup from './pages/auth/Signup';
 import CandidateDashboard from './pages/candidate/Dashboard';
 import ProfileUpload from './pages/candidate/ProfileUpload';
 import Schedule from './pages/candidate/Schedule';
+import Interview from './pages/candidate/Interview';
 import AdminDashboard from './pages/admin/Dashboard';
 import CandidateDetails from './pages/admin/CandidateDetails';
 
@@ -99,6 +100,14 @@ function MainRoutes() {
                 <Schedule />
               </ProtectedRoute>
             }
+            />
+            <Route
+              path="/interview/live"
+              element={
+                <ProtectedRoute allowedRoles={['candidate']}>
+                  <Interview />
+                </ProtectedRoute>
+              }
             />
             <Route path="/schedule" element={<Navigate to="/interview" replace />} />
 

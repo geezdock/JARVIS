@@ -131,7 +131,7 @@ All endpoints built and Supabase-integrated:
 
 ---
 
-### Phase 8: Video Interview Recording [0% - NOT STARTED]
+### Phase 8: Video Interview Recording [55% - IN PROGRESS]
 
 **Goal:** Enable candidates to record video interviews during scheduled slots.
 
@@ -162,6 +162,23 @@ All endpoints built and Supabase-integrated:
   - Show transcription/summary if available
 
 **Dependencies:** Phase 6 (File Storage), Phase 7 (AI Analysis optional)
+
+**Current progress update:**
+- [x] Candidate interview room page scaffold created at [frontend/src/pages/candidate/Interview.jsx](frontend/src/pages/candidate/Interview.jsx)
+- [x] Camera/microphone permission + local media preview implemented
+- [x] Start Interview routes directly to the live interview room (`/interview/live`)
+- [x] Consent notice is shown before any session creation or media permission request
+- [x] Backend session endpoints added:
+  - `POST /candidate/interview-session/start`
+  - `POST /candidate/interview-session/{session_id}/complete`
+  - `POST /candidate/storage/signed-interview-upload`
+  - `GET /admin/interview-session/{session_id}`
+- [x] Interview session schema added (`interview_sessions`, `interview_artifacts`) and `interview-media` bucket policies
+- [x] Session creation is consent-gated and limited to one session per application stage
+- [x] Interview media is stored privately with signed upload/read access
+- [ ] Wire full OpenAI Realtime media stream in browser (current room uses role-based scripted AI voice prompts and browser capture)
+- [ ] Add admin playback UI for saved interview artifacts
+- [ ] Finalize session scoring rubric and transcript enrichment
 
 ---
 
