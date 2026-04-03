@@ -14,6 +14,7 @@ create table if not exists public.candidates (
   ai_skills jsonb not null default '[]'::jsonb,
   ai_experience_level text,
   ai_generated_at timestamptz,
+  ai_transcript text,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );

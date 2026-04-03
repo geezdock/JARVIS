@@ -39,3 +39,12 @@ Use `backend/.env.example` as the source of truth for backend-only values, inclu
 - SUPABASE_ANON_KEY
 - SUPABASE_SERVICE_ROLE_KEY
 - SUPABASE_DB_URL
+
+## AI Resume Summarization
+
+The resume analysis endpoint uses OpenAI when `OPENAI_API_KEY` is set.
+
+- Default model: `gpt-4o-mini`
+- Keep requests short by extracting only the relevant resume text before sending it to the model
+- Review OpenAI pricing and rate limits before enabling production traffic
+- The backend falls back to a deterministic heuristic score if OpenAI is unavailable

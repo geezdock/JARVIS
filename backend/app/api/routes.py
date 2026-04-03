@@ -239,6 +239,86 @@ def _extract_pdf_text(file_bytes: bytes) -> str:
     return "\n".join(text_parts).strip()
 
 
+def _build_resume_prompt(candidate: dict[str, Any], latest_upload: dict[str, Any], extracted_text: str) -> str:
+    candidate_name = candidate.get("full_name", "the candidate")
+    candidate_role = candidate.get("role", "candidate")
+    file_name = latest_upload.get("file_name", "resume.pdf")
+    excerpt = extracted_text[:12000] if extracted_text else "No text could be extracted from the PDF."
+
+    return (
+        "You are an expert recruitment analyst. Review the resume content and return only valid JSON. "
+        "Do not include markdown. The JSON object must contain keys: summary (string), skills (array of strings), "
+        "experience_level (string), score (integer 0-100), transcript (string). "
+        f"Candidate name: {candidate_name}. Candidate role: {candidate_role}. File name: {file_name}. "
+        f"Resume text:\n{excerpt}"
+    )
+
+
+def _openai_resume_analysis(candidate: dict[str, Any], latest_upload: dict[str, Any], extracted_text: str) -> dict[str, Any]:
+    if not settings.openai_api_key:
+        raise SupabaseError("OPENAI_API_KEY is not configured")
+
+    prompt = _build_resume_prompt(candidate, latest_upload, extracted_text)
+    payload = {
+        "model": settings.openai_model,
+        "messages": [
+            {"role": "system", "content": "You analyze resumes and respond with strict JSON only."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+        "response_format": {"type": "json_object"},
+    }
+
+    req = request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {settings.openai_api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with request.urlopen(req, timeout=60) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except error.HTTPError as exc:
+        raw_error = exc.read().decode("utf-8") if exc.fp else ""
+        raise SupabaseError(raw_error or exc.reason) from exc
+
+    content = (((data.get("choices") or [])[0] or {}).get("message") or {}).get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise SupabaseError("OpenAI returned an empty analysis payload")
+
+    parsed = json.loads(content)
+    summary = str(parsed.get("summary") or "").strip()
+    skills = parsed.get("skills") or []
+    if not isinstance(skills, list):
+        skills = []
+    cleaned_skills = [str(skill).strip() for skill in skills if str(skill).strip()]
+    experience_level = str(parsed.get("experience_level") or "Mid level").strip() or "Mid level"
+    score = parsed.get("score")
+    if not isinstance(score, int):
+        try:
+            score = int(score)
+        except Exception:
+            score = 70
+    transcript = str(parsed.get("transcript") or summary or "Resume analysis completed.").strip()
+
+    if not summary:
+        summary = transcript
+
+    return {
+        "ai_summary": summary,
+        "ai_score": max(0, min(score, 100)),
+        "ai_skills": cleaned_skills,
+        "ai_experience_level": experience_level,
+        "ai_generated_at": datetime.now(UTC).isoformat(),
+        "ai_transcript": transcript,
+    }
+
+
 def _build_resume_analysis(candidate: dict[str, Any], latest_upload: dict[str, Any]) -> dict[str, Any]:
     file_url = latest_upload.get("file_url")
     file_name = latest_upload.get("file_name") or "resume.pdf"
@@ -247,9 +327,15 @@ def _build_resume_analysis(candidate: dict[str, Any], latest_upload: dict[str, A
     extracted_text = ""
     if isinstance(file_url, str) and file_url:
         try:
-          extracted_text = _extract_pdf_text(_download_url_bytes(file_url))
+            extracted_text = _extract_pdf_text(_download_url_bytes(file_url))
         except Exception:
             extracted_text = ""
+
+    if settings.openai_api_key:
+        try:
+            return _openai_resume_analysis(candidate, latest_upload, extracted_text)
+        except Exception:
+            pass
 
     normalized_text = re.sub(r"\s+", " ", extracted_text.lower())
 
@@ -335,6 +421,7 @@ def _candidate_detail_payload(candidate: dict[str, Any], latest_upload: dict[str
     analysis_score = candidate.get("ai_score")
     analysis_skills = candidate.get("ai_skills") or []
     analysis_level = candidate.get("ai_experience_level") or "Mid level"
+    analysis_transcript = candidate.get("ai_transcript") or analysis_summary
 
     return {
         "candidate": {
@@ -349,7 +436,7 @@ def _candidate_detail_payload(candidate: dict[str, Any], latest_upload: dict[str
         },
         "latestUpload": latest_upload,
         "slots": slots if isinstance(slots, list) else [],
-        "transcript": analysis_summary or "Upload a resume to generate an AI summary.",
+        "transcript": analysis_transcript or "Upload a resume to generate an AI summary.",
         "summary": analysis_summary or "AI resume analysis will appear here after the first run.",
     }
 

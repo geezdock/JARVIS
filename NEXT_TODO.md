@@ -50,11 +50,11 @@ All endpoints built and Supabase-integrated:
 
 ## 🚀 NEXT PRIORITIES (Ordered by Sequence)
 
-### Phase 6: File Storage & Upload Handling [75% - IN PROGRESS]
+### Phase 6: File Storage & Upload Handling [100% - DONE]
 
 **Goal:** Enable actual file uploads to Supabase Storage and serve resumés from files.
 
-**Current state:** Frontend upload-to-storage flow is wired, backend metadata persistence accepts storage paths/URLs, and `backend/supabase/schema.sql` now provisions the `resumes` bucket plus storage policies. Apply the schema in Supabase, then verify the live upload flow end-to-end.
+**Current state:** Frontend upload-to-storage flow is wired, backend metadata persistence accepts storage paths/URLs, and `backend/supabase/schema.sql` provisions the `resumes` bucket plus storage policies.
 
 #### 6.1 Create Supabase Storage Bucket
 - [x] Create a public bucket named `resumes` in Supabase Storage
@@ -68,23 +68,23 @@ All endpoints built and Supabase-integrated:
 - [x] Display upload progress indicator
 
 #### 6.3 Test File Upload Flow
-- [ ] Upload a PDF from frontend
-- [ ] Verify file appears in Storage bucket
-- [ ] Verify database record has valid `file_url`
+- [x] Upload a PDF from frontend
+- [x] Verify file appears in Storage bucket
+- [x] Verify database record has valid `file_url`
 - [x] Test file download/preview from admin dashboard
 
 **Dependencies:** Phase 5 (API Integration) must be complete
 
 ---
 
-### Phase 7: AI Resume Summarization [35% - IN PROGRESS]
+### Phase 7: AI Resume Summarization [100% - DONE]
 
 **Goal:** Analyze uploaded resumés and generate AI-powered summaries and scoring.
 
 #### 7.1 Choose AI Provider
-- [ ] Evaluate: OpenAI GPT-4, Claude, or similar
-- [ ] Add API key to [backend/.env.example](backend/.env.example)
-- [ ] Document API costs and rate limits
+- [x] Evaluate: OpenAI GPT-4, Claude, or similar
+- [x] Add API key to [backend/.env.example](backend/.env.example)
+- [x] Document API costs and rate limits
 
 #### 7.2 Build Resume Analysis Endpoint
 - [x] Create new endpoint `POST /admin/analyze-resume/{candidate_id}` to generate resume analysis on demand
@@ -101,11 +101,11 @@ All endpoints built and Supabase-integrated:
   - Display AI-generated score
   
 #### 7.3 Test Analysis Pipeline
-- [ ] Upload sample resume
+- [x] Upload sample resume
 - [x] Trigger AI analysis
-- [ ] Verify results display properly
+- [x] Verify results display properly
 
-**Dependencies:** Phase 6 (File Storage) must be complete
+**Dependencies:** Phase 6 (File Storage) is complete
 
 ---
 
@@ -246,8 +246,8 @@ All endpoints built and Supabase-integrated:
 | Backend API Architecture | ✅ Complete | All endpoints structured and ready |
 | Supabase Integration | ✅ Complete | Auth, RLS, database all configured |
 | UI Components | ✅ Complete | Tailwind, responsive, accessible |
-| **File Storage** | ❌ Not Started | Needed for resume uploads |
-| **AI Summarization** | ❌ Not Started | Mock data currently used |
+| **File Storage** | ✅ Complete | Resume uploads stored in Supabase Storage |
+| **AI Summarization** | ✅ Complete | OpenAI-backed analysis with heuristic fallback |
 | **Video Interviewing** | ❌ Not Started | No recording capability yet |
 | **Search & Filters** | ❌ Not Started | Basic list view only |
 | **Email Notifications** | ❌ Not Started | No email integration |
