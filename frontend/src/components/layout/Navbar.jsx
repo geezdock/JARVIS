@@ -1,14 +1,22 @@
 import React from 'react';
-import { Link, NavLink, useNavigate } from 'react-router-dom';
+import { Link, NavLink, useLocation, useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
-import { BriefcaseBusiness, CalendarDays, LayoutDashboard, LogOut, Shield, UserRoundCheck } from 'lucide-react';
+import { ArrowLeft, BriefcaseBusiness, CalendarDays, LayoutDashboard, LogOut, Shield, UserRoundCheck } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { useAuth } from '../../contexts/AuthContext';
 import Button from '../ui/Button';
 
 export default function Navbar() {
-  const { user, role, logout } = useAuth();
+  const { user, role, logout, interviewLock } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
+
+  const interviewLocked = Boolean(interviewLock?.active);
+  const isCandidateInterviewRoute =
+    role === 'candidate' && (location.pathname === '/interview' || location.pathname === '/interview/live');
+  const isLiveInterviewLocked = role === 'candidate' && location.pathname === '/interview/live' && interviewLocked;
+  const dashboardPath = role === 'admin' ? '/admin' : '/candidate';
+  const backPath = '/candidate';
 
   const onLogout = async () => {
     try {
@@ -25,6 +33,15 @@ export default function Navbar() {
       isActive ? 'bg-teal-100 text-teal-900' : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
     }`;
 
+  const brandContent = (
+    <>
+      <span className="rounded-lg bg-[#0d9488] p-2 text-white">
+        <BriefcaseBusiness size={18} />
+      </span>
+      <span className="text-lg font-black tracking-tight">Jarvis Recruit AI</span>
+    </>
+  );
+
   return (
     <motion.nav
       initial={{ opacity: 0, y: -8 }}
@@ -32,17 +49,28 @@ export default function Navbar() {
       className="sticky top-0 z-40 border-b border-slate-200 bg-white/90 backdrop-blur"
     >
       <div className="mx-auto flex w-full max-w-7xl items-center justify-between px-4 py-3 sm:px-6 lg:px-8">
-        <Link to="/" className="flex items-center gap-2 text-slate-900">
-          <span className="rounded-lg bg-[#0d9488] p-2 text-white">
-            <BriefcaseBusiness size={18} />
-          </span>
-          <span className="text-lg font-black tracking-tight">Jarvis Recruit AI</span>
-        </Link>
+        {isLiveInterviewLocked ? (
+          <div className="flex cursor-default items-center gap-2 text-slate-900" aria-label="Jarvis Recruit AI">
+            {brandContent}
+          </div>
+        ) : (
+          <Link to={user ? dashboardPath : '/'} className="flex items-center gap-2 text-slate-900">
+            {brandContent}
+          </Link>
+        )}
 
         <div className="flex items-center gap-2 sm:gap-3">
         {user ? (
           <>
-            {role === 'admin' ? (
+            {isLiveInterviewLocked ? null : isCandidateInterviewRoute ? (
+              <Button variant="secondary" size="sm" onClick={() => navigate(backPath)} className="gap-1.5">
+                <ArrowLeft size={16} /> Back to Dashboard
+              </Button>
+            ) : interviewLocked ? (
+              <div className="rounded-lg bg-amber-100 px-3 py-2 text-sm font-semibold text-amber-800">
+                Interview in progress
+              </div>
+            ) : role === 'admin' ? (
               <NavLink to="/admin" className={navLinkClass}>
                 <span className="inline-flex items-center gap-1.5">
                   <Shield size={16} /> Admin
@@ -67,10 +95,11 @@ export default function Navbar() {
                 </NavLink>
               </>
             )}
-
-            <Button variant="secondary" size="sm" onClick={onLogout} className="gap-1.5">
-              <LogOut size={16} /> Logout
-            </Button>
+              {!isLiveInterviewLocked && !isCandidateInterviewRoute ? (
+                <Button variant="secondary" size="sm" onClick={onLogout} className="gap-1.5" disabled={interviewLocked}>
+                  <LogOut size={16} /> Logout
+                </Button>
+              ) : null}
           </>
         ) : (
           <>

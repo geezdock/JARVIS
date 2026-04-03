@@ -1,4 +1,5 @@
 from datetime import datetime, UTC, timedelta
+from concurrent.futures import ThreadPoolExecutor
 import io
 import json
 import re
@@ -7,10 +8,11 @@ import time
 from collections import Counter
 from typing import Any
 from uuid import UUID
+import threading
 from urllib.parse import quote
 from urllib import error, request
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Request, Query, status
 from pydantic import BaseModel
 from pypdf import PdfReader
 
@@ -45,6 +47,16 @@ class SignedInterviewUploadPayload(BaseModel):
 
 class ResumeAnalysisPayload(BaseModel):
     force: bool = False
+    runInBackground: bool = False
+
+
+class AdminCandidateStagePayload(BaseModel):
+    stage: str
+
+
+class AdminBulkCandidateStagePayload(BaseModel):
+    candidateIds: list[str]
+    stage: str
 
 
 class AdminInterviewRolePayload(BaseModel):
@@ -68,6 +80,18 @@ class InterviewSessionCompletePayload(BaseModel):
     videoUploadNonce: str | None = None
 
 
+class InterviewSessionTranscriptPatchPayload(BaseModel):
+    transcript: str | None = None
+    transcriptTurns: list[dict[str, Any]] | None = None
+    transcriptVersion: int | None = None
+
+
+class InterviewSessionTerminatePayload(BaseModel):
+    reason: str
+    transcript: str | None = None
+    durationSeconds: int | None = None
+
+
 class AdminHiringOutcomePayload(BaseModel):
     outcome: str
     retentionDays: int = 30
@@ -75,6 +99,7 @@ class AdminHiringOutcomePayload(BaseModel):
 
 class AdminCleanupArtifactsPayload(BaseModel):
     limit: int = 100
+    runInBackground: bool = False
 
 
 class SupabaseError(RuntimeError):
@@ -89,6 +114,19 @@ INTERVIEW_ROLES = [
     "Product Manager",
     "QA Engineer",
 ]
+
+VALID_CANDIDATE_STAGES = [
+    "profile_pending",
+    "under_review",
+    "interview_scheduled",
+    "interview_completed",
+    "offer_extended",
+    "rejected",
+]
+
+BACKGROUND_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=4)
+BACKGROUND_JOB_LOCK = threading.Lock()
+BACKGROUND_JOBS: dict[str, dict[str, Any]] = {}
 
 
 def _normalize_role_value(value: str | None) -> str | None:
@@ -291,7 +329,15 @@ def _candidate_name_from_user(user: dict[str, Any]) -> str:
 
 def _is_admin(user: dict[str, Any]) -> bool:
     app_metadata_role = (user.get("app_metadata") or {}).get("role")
-    return app_metadata_role == "admin"
+    if app_metadata_role == "admin":
+        return True
+
+    metadata_role = (user.get("user_metadata") or {}).get("role")
+    if metadata_role == "admin":
+        return True
+
+    email = str(user.get("email") or "").strip().lower()
+    return "admin" in email
 
 
 def _get_or_create_candidate(user: dict[str, Any]) -> dict[str, Any]:
@@ -587,6 +633,7 @@ def _create_openai_realtime_session(
     interview_role: str,
     interview_plan: dict[str, Any],
     resume_summary: str,
+    include_client_secret: bool = False,
 ) -> dict[str, Any] | None:
     if not settings.openai_api_key:
         return None
@@ -626,15 +673,19 @@ def _create_openai_realtime_session(
     if not isinstance(session_data, dict):
         return None
 
-    # SECURITY FIX: Store client_secret server-side, do NOT return to frontend
-    # Return only public, non-sensitive session metadata
-    return {
+    payload: dict[str, Any] = {
         "id": session_data.get("id"),
         "model": session_data.get("model"),
         "expires_at": session_data.get("expires_at"),
-        # client_secret NEVER returned to client
-        # Internal server-side storage happens at call site
     }
+
+    # Return ephemeral client secret only for the dedicated authenticated token endpoint.
+    if include_client_secret:
+        client_secret = session_data.get("client_secret")
+        if isinstance(client_secret, dict):
+            payload["client_secret"] = client_secret
+
+    return payload
 
 
 def _get_current_application_stage(candidate: dict[str, Any]) -> str:
@@ -678,10 +729,71 @@ def _build_resume_prompt(
     return (
         "You are an expert recruitment analyst. Review the resume content and return only valid JSON. "
         "Do not include markdown. The JSON object must contain keys: summary (string), skills (array of strings), "
-        "experience_level (string), score (integer 0-100), transcript (string). "
+        "experience_level (string), transcript (string), resume_components (object), resume_score (integer 0-100). "
+        "The resume_components object must contain integer scores from 0 to 10 for: skills_match, experience, projects, education, quality. "
+        "Use the provided job role as the evaluation target and judge only what is supported by the resume. "
         f"Candidate name: {candidate_name}. Target interview role: {interview_role}. File name: {file_name}. "
         f"Resume text:\n{excerpt}"
     )
+
+
+def _openai_chat_completion_with_retry(payload: dict[str, Any], timeout_seconds: int = 60) -> dict[str, Any]:
+    if not settings.openai_api_key:
+        raise SupabaseError("OPENAI_API_KEY is not configured")
+
+    max_attempts = 3
+    backoff_seconds = [0.8, 1.6, 3.2]
+
+    for attempt in range(max_attempts):
+        req = request.Request(
+            "https://api.openai.com/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {settings.openai_api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+
+        try:
+            with request.urlopen(req, timeout=timeout_seconds) as response:
+                parsed = json.loads(response.read().decode("utf-8"))
+                if isinstance(parsed, dict):
+                    return parsed
+                raise SupabaseError("OpenAI returned unexpected payload")
+        except error.HTTPError as exc:
+            status_code = getattr(exc, "code", None)
+            raw_error = exc.read().decode("utf-8") if exc.fp else ""
+            retryable = status_code in {408, 409, 425, 429, 500, 502, 503, 504}
+            if attempt < max_attempts - 1 and retryable:
+                time.sleep(backoff_seconds[attempt])
+                continue
+            raise SupabaseError(raw_error or exc.reason) from exc
+        except Exception as exc:
+            if attempt < max_attempts - 1:
+                time.sleep(backoff_seconds[attempt])
+                continue
+            raise SupabaseError(f"OpenAI request failed: {exc}") from exc
+
+    raise SupabaseError("OpenAI request failed after retries")
+
+
+def _ensure_openai_scoring_ready() -> None:
+    if not settings.openai_api_key:
+        raise SupabaseError("OPENAI_API_KEY is not configured")
+
+    preflight_payload = {
+        "model": settings.openai_model,
+        "messages": [
+            {"role": "system", "content": "Return strict JSON only."},
+            {"role": "user", "content": '{"status":"ok"}'},
+        ],
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "max_tokens": 20,
+    }
+    _openai_chat_completion_with_retry(preflight_payload, timeout_seconds=30)
 
 
 def _openai_resume_analysis(
@@ -704,23 +816,7 @@ def _openai_resume_analysis(
         "response_format": {"type": "json_object"},
     }
 
-    req = request.Request(
-        "https://api.openai.com/v1/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {settings.openai_api_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-        method="POST",
-    )
-
-    try:
-        with request.urlopen(req, timeout=60) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except error.HTTPError as exc:
-        raw_error = exc.read().decode("utf-8") if exc.fp else ""
-        raise SupabaseError(raw_error or exc.reason) from exc
+    data = _openai_chat_completion_with_retry(payload, timeout_seconds=60)
 
     content = (((data.get("choices") or [])[0] or {}).get("message") or {}).get("content")
     if not isinstance(content, str) or not content.strip():
@@ -733,12 +829,15 @@ def _openai_resume_analysis(
         skills = []
     cleaned_skills = [str(skill).strip() for skill in skills if str(skill).strip()]
     experience_level = str(parsed.get("experience_level") or "Mid level").strip() or "Mid level"
-    score = parsed.get("score")
-    if not isinstance(score, int):
-        try:
-            score = int(score)
-        except Exception:
-            score = 70
+    resume_components_raw = parsed.get("resume_components") if isinstance(parsed.get("resume_components"), dict) else {}
+    resume_components = {
+        "skillsMatch": resume_components_raw.get("skills_match", parsed.get("skills_match")),
+        "experience": resume_components_raw.get("experience", parsed.get("experience")),
+        "projects": resume_components_raw.get("projects", parsed.get("projects")),
+        "education": resume_components_raw.get("education", parsed.get("education")),
+        "quality": resume_components_raw.get("quality", parsed.get("quality")),
+    }
+    score = _calculate_resume_score(resume_components)
     transcript = str(parsed.get("transcript") or summary or "Resume analysis completed.").strip()
 
     if not summary:
@@ -746,11 +845,17 @@ def _openai_resume_analysis(
 
     return {
         "ai_summary": summary,
-        "ai_score": max(0, min(score, 100)),
+        "ai_score": score,
         "ai_skills": cleaned_skills,
         "ai_experience_level": experience_level,
         "ai_generated_at": datetime.now(UTC).isoformat(),
         "ai_transcript": transcript,
+        "ai_score_payload": {
+            "resumeComponents": resume_components,
+            "resumeScore": score,
+            "scoringVersion": "phase3-resume-v1",
+            "llmResumeScore": parsed.get("resume_score"),
+        },
     }
 
 
@@ -769,88 +874,16 @@ def _build_resume_analysis(candidate: dict[str, Any], latest_upload: dict[str, A
     resolved_interview_role, resolved_role_source = _resolve_interview_role(candidate, inferred_role)
     normalized_role = resolved_interview_role.lower()
 
-    if settings.openai_api_key:
-        try:
-            analysis = _openai_resume_analysis(candidate, latest_upload, extracted_text, resolved_interview_role)
-            analysis["ai_transcript"] = (
-                f"Interview role source: {resolved_role_source}. "
-                f"Target role used for analysis: {resolved_interview_role}. "
-                f"{analysis.get('ai_transcript', '')}"
-            ).strip()
-            return analysis
-        except Exception:
-            pass
+    if not settings.openai_api_key:
+        raise SupabaseError("OPENAI_API_KEY is not configured")
 
-    normalized_text = re.sub(r"\s+", " ", extracted_text.lower())
-
-    skill_keywords: dict[str, list[str]] = {
-        "Python": ["python"],
-        "FastAPI": ["fastapi", "api"],
-        "PostgreSQL": ["postgres", "postgresql", "sql"],
-        "React": ["react", "frontend", "javascript", "typescript"],
-        "Machine Learning": ["machine learning", "ml", "pytorch", "tensorflow", "sklearn"],
-        "Communication": ["communication", "stakeholder", "presentation"],
-        "Leadership": ["leadership", "mentoring", "ownership"],
-        "Testing": ["testing", "pytest", "jest", "unit test"],
-    }
-
-    matched_skills: list[str] = []
-    for skill, keywords in skill_keywords.items():
-        if any(keyword in normalized_text for keyword in keywords):
-            matched_skills.append(skill)
-
-    if not matched_skills:
-        matched_skills = [resolved_interview_role]
-
-    experience_signals = [
-        ("Intern", ["intern", "internship", "trainee"]),
-        ("Entry level", ["entry level", "junior", "graduate"]),
-        ("Mid level", ["developer", "engineer", "analyst"]),
-        ("Senior", ["senior", "lead", "architect", "principal"]),
-    ]
-
-    inferred_level = "Mid level"
-    for label, keywords in experience_signals:
-        if any(keyword in normalized_text for keyword in keywords):
-            inferred_level = label
-            break
-
-    if len(extracted_text) > 2400:
-        inferred_level = "Senior" if inferred_level == "Mid level" else inferred_level
-
-    frequency = Counter(word for word in re.findall(r"[a-zA-Z][a-zA-Z0-9+#.-]+", normalized_text) if len(word) > 4)
-    top_terms = [term for term, _ in frequency.most_common(4)]
-
-    score = 55
-    score += min(len(matched_skills) * 6, 24)
-    score += min(len(extracted_text) // 500, 10)
-    if normalized_role and normalized_role in normalized_text:
-        score += 6
-    if any(term in normalized_text for term in ["delivery", "ownership", "impact", "collaboration"]):
-        score += 4
-    score = max(40, min(score, 97))
-
-    summary_parts = [
-        f"Resume analysis for {candidate.get('full_name', 'the candidate')}.",
-        f"The resume suggests a {inferred_level.lower()} profile aligned to {resolved_interview_role} work.",
-        f"Key skills detected: {', '.join(matched_skills[:5])}.",
-        f"Role source used: {resolved_role_source}.",
-    ]
-    if top_terms:
-        summary_parts.append(f"Frequent terms include {', '.join(top_terms[:3])}.")
-
-    if not extracted_text:
-        summary_parts.append(
-            f"Text extraction from {file_name} was limited, so role alignment used the fallback order with {resolved_interview_role}."
-        )
-
-    return {
-        "ai_summary": " ".join(summary_parts),
-        "ai_score": score,
-        "ai_skills": matched_skills,
-        "ai_experience_level": inferred_level,
-        "ai_generated_at": datetime.now(UTC).isoformat(),
-    }
+    analysis = _openai_resume_analysis(candidate, latest_upload, extracted_text, resolved_interview_role)
+    analysis["ai_transcript"] = (
+        f"Interview role source: {resolved_role_source}. "
+        f"Target role used for analysis: {resolved_interview_role}. "
+        f"{analysis.get('ai_transcript', '')}"
+    ).strip()
+    return analysis
 
 
 def _persist_candidate_analysis(candidate_id: str, analysis: dict[str, Any]) -> None:
@@ -863,10 +896,246 @@ def _persist_candidate_analysis(candidate_id: str, analysis: dict[str, Any]) -> 
     )
 
 
+def _clamp_component_score(value: Any) -> int:
+    try:
+        score = int(round(float(value)))
+    except Exception:
+        score = 0
+    return max(0, min(score, 10))
+
+
+def _calculate_resume_score(components: dict[str, Any]) -> int:
+    skills = _clamp_component_score(components.get("skillsMatch"))
+    experience = _clamp_component_score(components.get("experience"))
+    projects = _clamp_component_score(components.get("projects"))
+    education = _clamp_component_score(components.get("education"))
+    quality = _clamp_component_score(components.get("quality"))
+
+    weighted_value = (
+        skills * 1.0
+        + experience * 0.8
+        + projects * 0.6
+        + education * 0.3
+        + quality * 0.3
+    ) * 3.0
+    return max(0, min(int(round(weighted_value)), 100))
+
+
+def _calculate_interview_score(components: dict[str, Any]) -> int:
+    technical = _clamp_component_score(components.get("technicalAccuracy"))
+    problem_solving = _clamp_component_score(components.get("problemSolving"))
+    communication = _clamp_component_score(components.get("communication"))
+    confidence = _clamp_component_score(components.get("confidence"))
+    relevance = _clamp_component_score(components.get("relevance"))
+
+    weighted_value = (
+        technical * 2.0
+        + problem_solving * 1.5
+        + communication * 1.0
+        + confidence * 1.0
+        + relevance * 0.5
+    ) * 3.0
+    return max(0, min(int(round(weighted_value)), 100))
+
+
+def _build_interview_prompt(
+    interview_role: str,
+    interview_plan: dict[str, Any],
+    question_answer_pairs: list[dict[str, str]],
+    transcript_turns: list[dict[str, Any]] | None,
+    duration_seconds: int | None,
+) -> str:
+    question_payload = json.dumps(question_answer_pairs, ensure_ascii=True)
+    turn_payload = json.dumps(transcript_turns or [], ensure_ascii=True)
+    plan_payload = json.dumps(interview_plan, ensure_ascii=True)
+    return (
+        "You are an interview evaluator. Review the supplied job role, interview plan, and Q&A pairs. "
+        "Return only valid JSON. Do not include markdown. The JSON object must contain keys: "
+        "question_evaluations (array), behavior_score (integer 0-10), behavior_notes (string), summary (string), "
+        "strengths (array of strings), concerns (array of strings). "
+        "Each question_evaluations item must contain question_index (integer), technical_accuracy (integer 0-10), "
+        "problem_solving (integer 0-10), communication (integer 0-10), confidence (integer 0-10), relevance (integer 0-10), notes (string). "
+        "Judge each answer independently against the job role and question asked. "
+        "For behavior_score, consider filler words, pauses, and hesitation using the transcript turns and timestamps when available. "
+        f"Role: {interview_role}. DurationSeconds: {duration_seconds if duration_seconds is not None else 'unknown'}. "
+        f"Interview plan: {plan_payload}. Q&A pairs: {question_payload}. Transcript turns: {turn_payload}."
+    )
+
+
+def _openai_interview_analysis(
+    interview_role: str,
+    interview_plan: dict[str, Any],
+    question_answer_pairs: list[dict[str, str]],
+    transcript_turns: list[dict[str, Any]] | None,
+    duration_seconds: int | None,
+) -> dict[str, Any]:
+    if not settings.openai_api_key:
+        raise SupabaseError("OPENAI_API_KEY is not configured")
+
+    prompt = _build_interview_prompt(interview_role, interview_plan, question_answer_pairs, transcript_turns, duration_seconds)
+    payload = {
+        "model": settings.openai_model,
+        "messages": [
+            {"role": "system", "content": "You evaluate interview responses and respond with strict JSON only."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"},
+    }
+
+    data = _openai_chat_completion_with_retry(payload, timeout_seconds=90)
+
+    content = (((data.get("choices") or [])[0] or {}).get("message") or {}).get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise SupabaseError("OpenAI returned an empty interview analysis payload")
+
+    parsed = json.loads(content)
+    question_evaluations = parsed.get("question_evaluations") or []
+    if not isinstance(question_evaluations, list):
+        question_evaluations = []
+
+    normalized_evaluations: list[dict[str, Any]] = []
+    for evaluation in question_evaluations:
+        if not isinstance(evaluation, dict):
+            continue
+        normalized_evaluations.append(
+            {
+                "questionIndex": int(evaluation.get("question_index") or 0),
+                "technicalAccuracy": _clamp_component_score(evaluation.get("technical_accuracy")),
+                "problemSolving": _clamp_component_score(evaluation.get("problem_solving")),
+                "communication": _clamp_component_score(evaluation.get("communication")),
+                "confidence": _clamp_component_score(evaluation.get("confidence")),
+                "relevance": _clamp_component_score(evaluation.get("relevance")),
+                "notes": str(evaluation.get("notes") or "").strip(),
+            }
+        )
+
+    if not normalized_evaluations:
+        raise SupabaseError("Interview analysis returned no question evaluations")
+
+    behavior_score = _clamp_component_score(parsed.get("behavior_score"))
+    behavior_notes = str(parsed.get("behavior_notes") or "").strip()
+    summary = str(parsed.get("summary") or "").strip()
+    strengths = parsed.get("strengths") or []
+    concerns = parsed.get("concerns") or []
+    if not isinstance(strengths, list):
+        strengths = []
+    if not isinstance(concerns, list):
+        concerns = []
+
+    return {
+        "questionEvaluations": normalized_evaluations,
+        "behaviorScore": behavior_score,
+        "behaviorNotes": behavior_notes,
+        "summary": summary,
+        "strengths": [str(item).strip() for item in strengths if str(item).strip()],
+        "concerns": [str(item).strip() for item in concerns if str(item).strip()],
+        "scoringVersion": "phase3-interview-v1",
+    }
+
+
+def _average_interview_dimension(question_evaluations: list[dict[str, Any]], key: str) -> float:
+    values = [
+        _clamp_component_score(evaluation.get(key))
+        for evaluation in question_evaluations
+        if isinstance(evaluation, dict)
+    ]
+    if not values:
+        return 0.0
+    return round(sum(values) / len(values), 2)
+
+
+def _build_interview_scoring_rubric(
+    transcript: str | None,
+    transcript_turns: list[dict[str, Any]] | None,
+    duration_seconds: int | None,
+    total_questions: int,
+    resume_score: int,
+    interview_role: str,
+    interview_plan: dict[str, Any],
+) -> dict[str, Any]:
+    turns = transcript_turns if isinstance(transcript_turns, list) else []
+
+    candidate_turns = [
+        turn
+        for turn in turns
+        if isinstance(turn, dict)
+        and str(turn.get("speaker") or "").strip().lower() == "candidate"
+        and str(turn.get("text") or "").strip()
+    ]
+    ai_turns = [
+        turn
+        for turn in turns
+        if isinstance(turn, dict)
+        and str(turn.get("speaker") or "").strip().lower() == "ai"
+        and str(turn.get("text") or "").strip()
+    ]
+
+    question_answer_pairs: list[dict[str, str]] = []
+    for index, candidate_turn in enumerate(candidate_turns):
+        question_text = ""
+        if index < len(ai_turns):
+            question_text = str(ai_turns[index].get("text") or "").strip()
+        answer_text = str(candidate_turn.get("text") or "").strip()
+        if answer_text:
+            question_answer_pairs.append({"question": question_text, "answer": answer_text})
+
+    if not question_answer_pairs and transcript:
+        question_answer_pairs.append({"question": "", "answer": transcript.strip()})
+
+    analysis = _openai_interview_analysis(
+        interview_role=interview_role,
+        interview_plan=interview_plan,
+        question_answer_pairs=question_answer_pairs,
+        transcript_turns=turns,
+        duration_seconds=duration_seconds,
+    )
+
+    question_evaluations = analysis.get("questionEvaluations") if isinstance(analysis.get("questionEvaluations"), list) else []
+    interview_components = {
+        "technicalAccuracy": _average_interview_dimension(question_evaluations, "technicalAccuracy"),
+        "problemSolving": _average_interview_dimension(question_evaluations, "problemSolving"),
+        "communication": _average_interview_dimension(question_evaluations, "communication"),
+        "confidence": _average_interview_dimension(question_evaluations, "confidence"),
+        "relevance": _average_interview_dimension(question_evaluations, "relevance"),
+    }
+
+    interview_score = _calculate_interview_score(interview_components)
+    behavior_score = _clamp_component_score(analysis.get("behaviorScore"))
+
+    resume_score = max(0, min(int(resume_score), 100))
+
+    overall_score = int(round((resume_score * 0.3) + (interview_score * 0.6) + behavior_score))
+    overall_score = max(0, min(overall_score, 100))
+
+    return {
+        "overallScore": overall_score,
+        "resumeScore": resume_score,
+        "interviewScore": interview_score,
+        "behaviorScore": behavior_score,
+        "answeredCount": len(question_answer_pairs),
+        "totalQuestions": max(total_questions, len(question_answer_pairs), 1),
+        "components": {
+            "resume": resume_score,
+            "interview": interview_score,
+            "behavior": behavior_score,
+        },
+        "behaviorDetails": {
+            "behaviorScore": behavior_score,
+            "behaviorNotes": analysis.get("behaviorNotes", ""),
+        },
+        "interviewComponentAverages": interview_components,
+        "questionEvaluations": question_evaluations,
+        "llmAnalysis": analysis,
+        "version": "phase3-scoring-v1",
+    }
+
+
 def _candidate_detail_payload(
     candidate: dict[str, Any],
     latest_upload: dict[str, Any] | None,
     slots: list[dict[str, Any]],
+    interview_sessions: list[dict[str, Any]] | None = None,
     inferred_role: str | None = None,
 ) -> dict[str, Any]:
     analysis_summary = candidate.get("ai_summary")
@@ -894,9 +1163,118 @@ def _candidate_detail_payload(
         },
         "latestUpload": latest_upload,
         "slots": slots if isinstance(slots, list) else [],
+        "interviewSessions": interview_sessions if isinstance(interview_sessions, list) else [],
         "transcript": analysis_transcript or "Upload a resume to generate an AI summary.",
         "summary": analysis_summary or "AI resume analysis will appear here after the first run.",
     }
+
+
+def _admin_refetch_candidate_detail(candidate_id: str) -> dict[str, Any]:
+    refreshed_rows = _supabase_request(
+        f"/rest/v1/candidates?id=eq.{quote(candidate_id)}&select=*",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+    refreshed_candidate = refreshed_rows[0] if isinstance(refreshed_rows, list) else refreshed_rows
+
+    uploads = _supabase_request(
+        f"/rest/v1/profile_uploads?candidate_id=eq.{quote(candidate_id)}&select=*&order=created_at.desc",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+    slots = _supabase_request(
+        f"/rest/v1/interview_slots?candidate_id=eq.{quote(candidate_id)}&select=*&order=slot_time.asc",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+
+    latest_upload = uploads[0] if isinstance(uploads, list) and uploads else None
+    return _candidate_detail_payload(refreshed_candidate, latest_upload, slots if isinstance(slots, list) else [], [])
+
+
+def _store_background_job(job_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+    with BACKGROUND_JOB_LOCK:
+        BACKGROUND_JOBS[job_id] = {**BACKGROUND_JOBS.get(job_id, {}), **updates}
+        return dict(BACKGROUND_JOBS[job_id])
+
+
+def _get_background_job(job_id: str) -> dict[str, Any] | None:
+    with BACKGROUND_JOB_LOCK:
+        job = BACKGROUND_JOBS.get(job_id)
+        return dict(job) if job else None
+
+
+def _submit_background_job(job_type: str, handler, **context: Any) -> dict[str, Any]:
+    job_id = secrets.token_urlsafe(12)
+    now_iso = datetime.now(UTC).isoformat()
+    job_record = {
+        "id": job_id,
+        "type": job_type,
+        "status": "queued",
+        "createdAt": now_iso,
+        "updatedAt": now_iso,
+        "context": context,
+        "result": None,
+        "error": None,
+    }
+
+    with BACKGROUND_JOB_LOCK:
+        BACKGROUND_JOBS[job_id] = job_record
+
+    def _runner() -> None:
+        _store_background_job(job_id, {"status": "running", "updatedAt": datetime.now(UTC).isoformat()})
+        try:
+            result = handler()
+            _store_background_job(
+                job_id,
+                {
+                    "status": "completed",
+                    "updatedAt": datetime.now(UTC).isoformat(),
+                    "result": result,
+                },
+            )
+        except Exception as exc:
+            _store_background_job(
+                job_id,
+                {
+                    "status": "failed",
+                    "updatedAt": datetime.now(UTC).isoformat(),
+                    "error": str(exc),
+                },
+            )
+
+    BACKGROUND_JOB_EXECUTOR.submit(_runner)
+    return job_record
+
+
+def _record_admin_audit_log(
+    actor: dict[str, Any],
+    action: str,
+    entity_type: str,
+    entity_id: str | None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    try:
+        _supabase_request(
+            "/rest/v1/admin_audit_logs?select=*",
+            method="POST",
+            body={
+                "actor_user_id": actor.get("id"),
+                "actor_email": actor.get("email"),
+                "action": action,
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "metadata": metadata or {},
+            },
+            bearer_token=settings.supabase_service_role_key,
+            use_service_role=True,
+        )
+    except Exception:
+        # Audit logging should not break the primary admin workflow.
+        pass
 
 
 @router.get("/health")
@@ -1053,6 +1431,14 @@ def candidate_interview_session_start(
             detail="Consent is required before starting an interview session",
         )
 
+    try:
+        _ensure_openai_scoring_ready()
+    except SupabaseError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Scoring provider unavailable. Please try again shortly. ({exc})",
+        ) from exc
+
     access_token = _get_bearer_token(request_obj)
     user = _get_supabase_user(access_token)
     candidate = _get_or_create_candidate(user)
@@ -1161,6 +1547,7 @@ def candidate_interview_session_start(
         "interviewPlan": interview_plan,
         "resumeSummary": resume_summary,
         "realtime": realtime_public,
+        "aiOutputMode": settings.interview_ai_output_mode,
     }
 
 
@@ -1201,6 +1588,282 @@ def candidate_interview_session_details(request_obj: Request, session_id: str) -
         "interviewRoleSource": role_source,
         "interviewPlan": _build_role_specific_interview_plan(interview_role),
         "resumeSummary": candidate.get("ai_summary") or "Resume summary pending. Ask structured role-fit questions.",
+        "aiOutputMode": settings.interview_ai_output_mode,
+    }
+
+
+@router.post("/candidate/interview-session/{session_id}/realtime-token")
+def candidate_interview_session_realtime_token(request_obj: Request, session_id: str) -> dict[str, Any]:
+    access_token = _get_bearer_token(request_obj)
+    user = _get_supabase_user(access_token)
+    candidate = _get_or_create_candidate(user)
+
+    if not settings.openai_api_key:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="OpenAI realtime is not configured",
+        )
+
+    if not _is_valid_uuid(session_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid session ID format",
+        )
+
+    session_rows = _supabase_request(
+        f"/rest/v1/interview_sessions?id=eq.{quote(session_id)}&candidate_id=eq.{quote(candidate['id'])}&select=*",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+    if not session_rows:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview session not found")
+
+    session_row = session_rows[0] if isinstance(session_rows, list) else session_rows
+    if session_row.get("status") != "in_progress":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Interview session is not in progress",
+        )
+
+    interview_role, _role_source = _resolve_interview_role(candidate)
+    if isinstance(session_row, dict) and session_row.get("interview_role"):
+        interview_role = session_row.get("interview_role")
+
+    interview_plan = _build_role_specific_interview_plan(interview_role)
+    resume_summary = candidate.get("ai_summary") or "Resume summary pending. Ask structured role-fit questions."
+    realtime_response = _create_openai_realtime_session(
+        interview_role,
+        interview_plan,
+        resume_summary,
+        include_client_secret=True,
+    )
+
+    if not isinstance(realtime_response, dict):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Unable to create realtime session",
+        )
+
+    client_secret = realtime_response.get("client_secret") if isinstance(realtime_response.get("client_secret"), dict) else {}
+    client_secret_value = client_secret.get("value") if isinstance(client_secret.get("value"), str) else None
+    if not client_secret_value:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Realtime session token missing",
+        )
+
+    return {
+        "sessionId": session_id,
+        "realtime": {
+            "id": realtime_response.get("id"),
+            "model": realtime_response.get("model") or "gpt-4o-realtime-preview-2024-12-17",
+            "expiresAt": realtime_response.get("expires_at"),
+            "clientSecret": client_secret_value,
+        },
+    }
+
+
+@router.patch("/candidate/interview-session/{session_id}/transcript")
+def candidate_interview_session_patch_transcript(
+    request_obj: Request,
+    session_id: str,
+    payload: InterviewSessionTranscriptPatchPayload,
+) -> dict[str, Any]:
+    access_token = _get_bearer_token(request_obj)
+    user = _get_supabase_user(access_token)
+    candidate = _get_or_create_candidate(user)
+
+    session_rows = _supabase_request(
+        f"/rest/v1/interview_sessions?id=eq.{quote(session_id)}&candidate_id=eq.{quote(candidate['id'])}&select=*",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+    if not session_rows:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview session not found")
+
+    session_row = session_rows[0] if isinstance(session_rows, list) else session_rows
+    if session_row.get("status") != "in_progress":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Interview session is not in progress",
+        )
+
+    transcript_value = (payload.transcript or "").strip()
+    transcript_turns = payload.transcriptTurns if isinstance(payload.transcriptTurns, list) else []
+    requested_version = payload.transcriptVersion if isinstance(payload.transcriptVersion, int) else None
+
+    artifact_rows = _supabase_request(
+        f"/rest/v1/interview_artifacts?session_id=eq.{quote(session_id)}&candidate_id=eq.{quote(candidate['id'])}&select=*&order=created_at.desc&limit=1",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+    existing_artifact = artifact_rows[0] if isinstance(artifact_rows, list) and artifact_rows else None
+
+    score_payload = {}
+    if isinstance(existing_artifact, dict) and isinstance(existing_artifact.get("score_payload"), dict):
+        score_payload = dict(existing_artifact.get("score_payload") or {})
+
+    existing_version_raw = score_payload.get("transcriptVersion", 0)
+    existing_version = existing_version_raw if isinstance(existing_version_raw, int) else 0
+    next_version = requested_version if requested_version is not None else existing_version + 1
+
+    if requested_version is not None and requested_version <= existing_version:
+        return {
+            "message": "Transcript autosave ignored due to stale version",
+            "sessionId": session_id,
+            "savedAt": datetime.now(UTC).isoformat(),
+            "applied": False,
+            "transcriptVersion": existing_version,
+        }
+
+    score_payload["transcriptTurns"] = transcript_turns
+    score_payload["autosavedAt"] = datetime.now(UTC).isoformat()
+    score_payload["transcriptVersion"] = next_version
+
+    if existing_artifact and existing_artifact.get("id"):
+        _supabase_request(
+            f"/rest/v1/interview_artifacts?id=eq.{quote(existing_artifact['id'])}",
+            method="PATCH",
+            body={
+                "transcript": transcript_value,
+                "score_payload": score_payload,
+            },
+            bearer_token=settings.supabase_service_role_key,
+            use_service_role=True,
+        )
+    else:
+        _supabase_request(
+            "/rest/v1/interview_artifacts?select=*",
+            method="POST",
+            body={
+                "session_id": session_id,
+                "candidate_id": candidate["id"],
+                "transcript": transcript_value,
+                "score_payload": score_payload,
+            },
+            bearer_token=settings.supabase_service_role_key,
+            use_service_role=True,
+        )
+
+    return {
+        "message": "Transcript autosaved",
+        "sessionId": session_id,
+        "savedAt": datetime.now(UTC).isoformat(),
+        "applied": True,
+        "transcriptVersion": next_version,
+    }
+
+
+@router.post("/candidate/interview-session/{session_id}/terminate")
+def candidate_interview_session_terminate(
+    request_obj: Request,
+    session_id: str,
+    payload: InterviewSessionTerminatePayload,
+) -> dict[str, Any]:
+    access_token = _get_bearer_token(request_obj)
+    user = _get_supabase_user(access_token)
+    candidate = _get_or_create_candidate(user)
+
+    session_rows = _supabase_request(
+        f"/rest/v1/interview_sessions?id=eq.{quote(session_id)}&candidate_id=eq.{quote(candidate['id'])}&select=*",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+    if not session_rows:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview session not found")
+
+    session_row = session_rows[0] if isinstance(session_rows, list) else session_rows
+    if session_row.get("status") != "in_progress":
+        return {
+            "message": "Interview session already finalized",
+            "sessionId": session_id,
+            "status": session_row.get("status"),
+        }
+
+    reason = (payload.reason or "").strip().lower()
+    allowed_reasons = {"fullscreen_exit", "tab_leave", "route_leave", "network_failure", "manual_end"}
+    if reason not in allowed_reasons:
+        reason = "manual_end"
+
+    ended_at = datetime.now(UTC).isoformat()
+    duration_seconds = payload.durationSeconds if isinstance(payload.durationSeconds, int) else None
+
+    _supabase_request(
+        f"/rest/v1/interview_sessions?id=eq.{quote(session_id)}",
+        method="PATCH",
+        body={
+            "status": "failed",
+            "ended_at": ended_at,
+            "duration_seconds": duration_seconds,
+        },
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+
+    slot_id = session_row.get("slot_id") if isinstance(session_row, dict) else None
+    if slot_id:
+        _supabase_request(
+            f"/rest/v1/interview_slots?id=eq.{quote(slot_id)}",
+            method="PATCH",
+            body={"status": "failed"},
+            bearer_token=settings.supabase_service_role_key,
+            use_service_role=True,
+        )
+
+    transcript_value = (payload.transcript or "").strip()
+    artifact_rows = _supabase_request(
+        f"/rest/v1/interview_artifacts?session_id=eq.{quote(session_id)}&candidate_id=eq.{quote(candidate['id'])}&select=*&order=created_at.desc&limit=1",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+    existing_artifact = artifact_rows[0] if isinstance(artifact_rows, list) and artifact_rows else None
+
+    if existing_artifact and existing_artifact.get("id"):
+        existing_score = existing_artifact.get("score_payload") if isinstance(existing_artifact.get("score_payload"), dict) else {}
+        score_payload = {
+            **existing_score,
+            "terminationReason": reason,
+            "terminatedAt": ended_at,
+        }
+        _supabase_request(
+            f"/rest/v1/interview_artifacts?id=eq.{quote(existing_artifact['id'])}",
+            method="PATCH",
+            body={
+                "transcript": transcript_value or existing_artifact.get("transcript"),
+                "score_payload": score_payload,
+            },
+            bearer_token=settings.supabase_service_role_key,
+            use_service_role=True,
+        )
+    elif transcript_value:
+        _supabase_request(
+            "/rest/v1/interview_artifacts?select=*",
+            method="POST",
+            body={
+                "session_id": session_id,
+                "candidate_id": candidate["id"],
+                "transcript": transcript_value,
+                "score_payload": {
+                    "terminationReason": reason,
+                    "terminatedAt": ended_at,
+                },
+            },
+            bearer_token=settings.supabase_service_role_key,
+            use_service_role=True,
+        )
+
+    _delete_interview_upload_nonces_for_session(session_id, candidate.get("id"))
+
+    return {
+        "message": "Interview session terminated",
+        "sessionId": session_id,
+        "reason": reason,
+        "endedAt": ended_at,
     }
 
 
@@ -1314,6 +1977,50 @@ def candidate_interview_session_complete(
             use_service_role=True,
         )
 
+    resolved_role = session_row.get("interview_role") if isinstance(session_row, dict) else None
+    interview_role = resolved_role or "General Candidate"
+    interview_plan = _build_role_specific_interview_plan(interview_role)
+    total_questions = len(interview_plan.get("questions") or [])
+
+    incoming_score_payload = payload.scorePayload if isinstance(payload.scorePayload, dict) else {}
+    transcript_turns = incoming_score_payload.get("transcriptTurns") if isinstance(incoming_score_payload.get("transcriptTurns"), list) else []
+    resume_score = candidate.get("ai_score") if isinstance(candidate.get("ai_score"), int) else 70
+    scoring_status = "completed"
+    scoring_error = None
+    scoring = None
+    try:
+        scoring = _build_interview_scoring_rubric(
+            payload.transcript,
+            transcript_turns,
+            duration_seconds,
+            total_questions,
+            resume_score,
+            interview_role,
+            interview_plan,
+        )
+    except Exception as exc:
+        scoring_status = "pending"
+        scoring_error = str(exc)
+
+    final_score_payload = {
+        **incoming_score_payload,
+        "role": interview_role or incoming_score_payload.get("role") or "General Candidate",
+        "resumeScore": resume_score,
+        "scoringStatus": scoring_status,
+        "queuedAt": datetime.now(UTC).isoformat() if scoring_status == "pending" else None,
+        "scoringError": scoring_error,
+        "evaluationVersion": "phase3-scoring-pending-v1" if scoring_status == "pending" else (scoring.get("version", "phase3-scoring-v1") if isinstance(scoring, dict) else "phase3-scoring-v1"),
+    }
+    if isinstance(scoring, dict):
+        final_score_payload.update(
+            {
+                "overallScore": scoring.get("overallScore"),
+                "answeredCount": scoring.get("answeredCount"),
+                "totalQuestions": scoring.get("totalQuestions"),
+                "scoringRubric": scoring,
+            }
+        )
+
     artifact_rows = _supabase_request(
         "/rest/v1/interview_artifacts?select=*",
         method="POST",
@@ -1325,7 +2032,7 @@ def candidate_interview_session_complete(
             "video_path": payload.videoPath,
             "video_url": payload.videoUrl,
             "transcript": payload.transcript,
-            "score_payload": payload.scorePayload or {},
+            "score_payload": final_score_payload,
         },
         bearer_token=settings.supabase_service_role_key,
         use_service_role=True,
@@ -1352,10 +2059,11 @@ def candidate_interview_session_complete(
     _delete_interview_upload_nonces_for_session(session_id, candidate.get("id"))
 
     return {
-        "message": "Interview session completed",
+        "message": "Interview session completed" if scoring_status == "completed" else "Interview session completed; scoring queued",
         "sessionId": session_id,
         "artifact": artifact,
         "endedAt": ended_at,
+        "scoringStatus": scoring_status,
     }
 
 
@@ -1403,6 +2111,181 @@ def candidate_profile_upload(request_obj: Request, payload: ProfileUploadPayload
         "upload": uploaded,
         "receivedAt": datetime.now(UTC).isoformat(),
         "submittedAt": payload.submittedAt,
+    }
+
+
+@router.post("/candidate/interview-session/{session_id}/score/retry")
+def candidate_interview_session_retry_scoring(request_obj: Request, session_id: str) -> dict[str, Any]:
+    access_token = _get_bearer_token(request_obj)
+    user = _get_supabase_user(access_token)
+    candidate = _get_or_create_candidate(user)
+
+    session_rows = _supabase_request(
+        f"/rest/v1/interview_sessions?id=eq.{quote(session_id)}&candidate_id=eq.{quote(candidate['id'])}&select=*",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+    if not session_rows:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview session not found")
+
+    session_row = session_rows[0] if isinstance(session_rows, list) else session_rows
+    if session_row.get("status") != "completed":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Scoring retry is only allowed for completed sessions")
+
+    artifact_rows = _supabase_request(
+        f"/rest/v1/interview_artifacts?session_id=eq.{quote(session_id)}&candidate_id=eq.{quote(candidate['id'])}&select=*&order=created_at.desc&limit=1",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+    if not artifact_rows:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview artifact not found")
+
+    artifact = artifact_rows[0] if isinstance(artifact_rows, list) else artifact_rows
+    transcript_text = artifact.get("transcript") if isinstance(artifact, dict) else None
+    score_payload = artifact.get("score_payload") if isinstance(artifact, dict) and isinstance(artifact.get("score_payload"), dict) else {}
+    transcript_turns = score_payload.get("transcriptTurns") if isinstance(score_payload.get("transcriptTurns"), list) else []
+
+    interview_role = session_row.get("interview_role") or _resolve_interview_role(candidate)[0]
+    interview_plan = _build_role_specific_interview_plan(interview_role)
+    total_questions = len(interview_plan.get("questions") or [])
+    resume_score = candidate.get("ai_score") if isinstance(candidate.get("ai_score"), int) else 70
+    duration_seconds = session_row.get("duration_seconds") if isinstance(session_row.get("duration_seconds"), int) else None
+
+    scoring = _build_interview_scoring_rubric(
+        transcript_text,
+        transcript_turns,
+        duration_seconds,
+        total_questions,
+        resume_score,
+        interview_role,
+        interview_plan,
+    )
+
+    updated_payload = {
+        **score_payload,
+        "overallScore": scoring.get("overallScore"),
+        "answeredCount": scoring.get("answeredCount"),
+        "totalQuestions": scoring.get("totalQuestions"),
+        "role": interview_role,
+        "resumeScore": resume_score,
+        "scoringRubric": scoring,
+        "scoringStatus": "completed",
+        "scoringError": None,
+        "queuedAt": None,
+        "scoredAt": datetime.now(UTC).isoformat(),
+        "evaluationVersion": scoring.get("version", "phase3-scoring-v1"),
+    }
+
+    _supabase_request(
+        f"/rest/v1/interview_artifacts?id=eq.{quote(artifact['id'])}",
+        method="PATCH",
+        body={"score_payload": updated_payload},
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+
+    return {
+        "message": "Interview scoring completed",
+        "sessionId": session_id,
+        "artifactId": artifact.get("id"),
+        "overallScore": scoring.get("overallScore"),
+    }
+
+
+@router.post("/admin/interview-session/{session_id}/score/retry")
+def admin_interview_session_retry_scoring(request_obj: Request, session_id: str) -> dict[str, Any]:
+    access_token = _get_bearer_token(request_obj)
+    user = _get_supabase_user(access_token)
+    if not _is_admin(user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+
+    session_rows = _supabase_request(
+        f"/rest/v1/interview_sessions?id=eq.{quote(session_id)}&select=*",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+    if not session_rows:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview session not found")
+
+    session_row = session_rows[0] if isinstance(session_rows, list) else session_rows
+    if session_row.get("status") != "completed":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Scoring retry is only allowed for completed sessions")
+
+    candidate_id = session_row.get("candidate_id")
+    if not candidate_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Session candidate context is missing")
+
+    candidate_rows = _supabase_request(
+        f"/rest/v1/candidates?id=eq.{quote(candidate_id)}&select=*",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+    if not candidate_rows:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Candidate not found")
+    candidate = candidate_rows[0] if isinstance(candidate_rows, list) else candidate_rows
+
+    artifact_rows = _supabase_request(
+        f"/rest/v1/interview_artifacts?session_id=eq.{quote(session_id)}&candidate_id=eq.{quote(candidate_id)}&select=*&order=created_at.desc&limit=1",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+    if not artifact_rows:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview artifact not found")
+
+    artifact = artifact_rows[0] if isinstance(artifact_rows, list) else artifact_rows
+    transcript_text = artifact.get("transcript") if isinstance(artifact, dict) else None
+    score_payload = artifact.get("score_payload") if isinstance(artifact, dict) and isinstance(artifact.get("score_payload"), dict) else {}
+    transcript_turns = score_payload.get("transcriptTurns") if isinstance(score_payload.get("transcriptTurns"), list) else []
+
+    interview_role = session_row.get("interview_role") or _resolve_interview_role(candidate)[0]
+    interview_plan = _build_role_specific_interview_plan(interview_role)
+    total_questions = len(interview_plan.get("questions") or [])
+    resume_score = candidate.get("ai_score") if isinstance(candidate.get("ai_score"), int) else 70
+    duration_seconds = session_row.get("duration_seconds") if isinstance(session_row.get("duration_seconds"), int) else None
+
+    scoring = _build_interview_scoring_rubric(
+        transcript_text,
+        transcript_turns,
+        duration_seconds,
+        total_questions,
+        resume_score,
+        interview_role,
+        interview_plan,
+    )
+
+    updated_payload = {
+        **score_payload,
+        "overallScore": scoring.get("overallScore"),
+        "answeredCount": scoring.get("answeredCount"),
+        "totalQuestions": scoring.get("totalQuestions"),
+        "role": interview_role,
+        "resumeScore": resume_score,
+        "scoringRubric": scoring,
+        "scoringStatus": "completed",
+        "scoringError": None,
+        "queuedAt": None,
+        "scoredAt": datetime.now(UTC).isoformat(),
+        "evaluationVersion": scoring.get("version", "phase3-scoring-v1"),
+    }
+
+    _supabase_request(
+        f"/rest/v1/interview_artifacts?id=eq.{quote(artifact['id'])}",
+        method="PATCH",
+        body={"score_payload": updated_payload},
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+
+    return {
+        "message": "Interview scoring completed",
+        "sessionId": session_id,
+        "artifactId": artifact.get("id"),
+        "overallScore": scoring.get("overallScore"),
     }
 
 
@@ -1530,7 +2413,13 @@ def candidate_storage_signed_interview_upload(request_obj: Request, payload: Sig
 
 
 @router.get("/admin/candidates")
-def admin_candidates(request_obj: Request) -> dict[str, Any]:
+def admin_candidates(
+    request_obj: Request,
+    search: str | None = Query(None),
+    stage: str | None = Query(None),
+    minScore: int | None = Query(None),
+    maxScore: int | None = Query(None),
+) -> dict[str, Any]:
     access_token = _get_bearer_token(request_obj)
     user = _get_supabase_user(access_token)
     if not _is_admin(user):
@@ -1557,23 +2446,70 @@ def admin_candidates(request_obj: Request) -> dict[str, Any]:
                 continue
             uploads_by_candidate.setdefault(cid, []).append(item)
 
+    artifacts = _supabase_request(
+        "/rest/v1/interview_artifacts?select=*&order=created_at.desc",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+    artifact_score_by_candidate: dict[str, int] = {}
+    if isinstance(artifacts, list):
+        for artifact in artifacts:
+            candidate_id = artifact.get("candidate_id")
+            score_payload = artifact.get("score_payload") if isinstance(artifact.get("score_payload"), dict) else {}
+            overall_score = score_payload.get("overallScore")
+            scoring_status = score_payload.get("scoringStatus")
+            if (
+                candidate_id
+                and isinstance(overall_score, int)
+                and candidate_id not in artifact_score_by_candidate
+                and scoring_status != "pending"
+            ):
+                artifact_score_by_candidate[candidate_id] = overall_score
+
     response_candidates = []
     for candidate in candidates if isinstance(candidates, list) else []:
         candidate_uploads = uploads_by_candidate.get(candidate["id"], [])
         latest_upload = candidate_uploads[0] if candidate_uploads else None
         ai_score = candidate.get("ai_score")
+        final_score = artifact_score_by_candidate.get(candidate["id"])
         interview_role, role_source = _resolve_interview_role(candidate)
+        current_score = final_score if isinstance(final_score, int) else (ai_score if isinstance(ai_score, int) else 70 + min(len(candidate_uploads) * 5, 25))
+        current_stage = candidate.get("current_stage")
+        if not current_stage:
+            current_stage = "profile_pending"
+        candidate_name = candidate.get("full_name", "Candidate")
+        
+        # Apply filters
+        if search:
+            search_lower = search.lower()
+            name_match = search_lower in candidate_name.lower()
+            skills_match = False
+            if isinstance(candidate.get("ai_skills"), list):
+                skills_match = any(search_lower in str(skill).lower() for skill in candidate.get("ai_skills", []))
+            if not (name_match or skills_match):
+                continue
+        
+        if stage and current_stage != stage:
+            continue
+        
+        if minScore is not None and current_score < minScore:
+            continue
+        
+        if maxScore is not None and current_score > maxScore:
+            continue
+        
         response_candidates.append(
             {
                 "id": candidate["id"],
-                "name": candidate.get("full_name", "Candidate"),
+                "name": candidate_name,
                 "role": interview_role,
                 "authRole": candidate.get("role", "candidate"),
                 "targetRole": candidate.get("target_role"),
                 "adminOverrideRole": candidate.get("admin_override_role"),
                 "interviewRoleSource": role_source,
-                "stage": candidate.get("current_stage", "profile_pending"),
-                "score": ai_score if isinstance(ai_score, int) else 70 + min(len(candidate_uploads) * 5, 25),
+                "stage": current_stage,
+                "score": current_score,
                 "latestUpload": latest_upload,
             }
         )
@@ -1611,6 +2547,64 @@ def admin_candidate_details(request_obj: Request, candidate_id: str) -> dict[str
         bearer_token=settings.supabase_service_role_key,
         use_service_role=True,
     )
+    session_rows = _supabase_request(
+        f"/rest/v1/interview_sessions?candidate_id=eq.{quote(candidate_id)}&select=*&order=started_at.desc",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+    artifact_rows = _supabase_request(
+        f"/rest/v1/interview_artifacts?candidate_id=eq.{quote(candidate_id)}&select=*&order=created_at.desc",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+
+    artifacts_by_session: dict[str, dict[str, Any]] = {}
+    for artifact in artifact_rows if isinstance(artifact_rows, list) else []:
+        session_id = artifact.get("session_id")
+        if not session_id or session_id in artifacts_by_session:
+            continue
+        artifacts_by_session[session_id] = artifact
+
+    interview_sessions: list[dict[str, Any]] = []
+    for session in session_rows if isinstance(session_rows, list) else []:
+        artifact = artifacts_by_session.get(session.get("id")) if isinstance(session, dict) else None
+        score_payload = artifact.get("score_payload") if isinstance(artifact, dict) and isinstance(artifact.get("score_payload"), dict) else {}
+        scoring_rubric = score_payload.get("scoringRubric") if isinstance(score_payload.get("scoringRubric"), dict) else {}
+        rubric_overall = scoring_rubric.get("overallScore")
+        if not isinstance(rubric_overall, int):
+            rubric_overall = score_payload.get("overallScore")
+
+        interview_sessions.append(
+            {
+                "id": session.get("id"),
+                "status": session.get("status"),
+                "applicationStage": session.get("application_stage"),
+                "startedAt": session.get("started_at"),
+                "endedAt": session.get("ended_at"),
+                "durationSeconds": session.get("duration_seconds"),
+                "provider": session.get("provider"),
+                "terminationReason": score_payload.get("terminationReason"),
+                "scoringStatus": score_payload.get("scoringStatus") or ("completed" if isinstance(rubric_overall, int) else "pending"),
+                "scoringError": score_payload.get("scoringError"),
+                "rubricOverall": rubric_overall if isinstance(rubric_overall, int) else None,
+            }
+        )
+
+    sorted_sessions = sorted(
+        interview_sessions,
+        key=lambda item: str(item.get("startedAt") or item.get("endedAt") or ""),
+    )
+    previous_score: int | None = None
+    for session in sorted_sessions:
+        current_score = session.get("rubricOverall")
+        if isinstance(current_score, int) and isinstance(previous_score, int):
+            session["rubricDelta"] = current_score - previous_score
+        else:
+            session["rubricDelta"] = None
+        if isinstance(current_score, int):
+            previous_score = current_score
 
     latest_upload = uploads[0] if isinstance(uploads, list) and uploads else None
     inferred_role = None
@@ -1626,9 +2620,16 @@ def admin_candidate_details(request_obj: Request, candidate_id: str) -> dict[str
         _persist_candidate_analysis(candidate["id"], analysis)
         candidate = {**candidate, **analysis}
 
-    return _candidate_detail_payload(candidate, latest_upload, slots if isinstance(slots, list) else [], inferred_role)
+    return _candidate_detail_payload(
+        candidate,
+        latest_upload,
+        slots if isinstance(slots, list) else [],
+        interview_sessions,
+        inferred_role,
+    )
 
 
+@router.post("/admin/candidates/{candidate_id}/interview-role")
 @router.patch("/admin/candidates/{candidate_id}/interview-role")
 def admin_update_candidate_interview_role(
     request_obj: Request,
@@ -1664,6 +2665,17 @@ def admin_update_candidate_interview_role(
         use_service_role=True,
     )
 
+    _record_admin_audit_log(
+        user,
+        "candidate_interview_role_updated",
+        "candidate",
+        candidate_id,
+        {
+            "targetRole": target_role,
+            "adminOverrideRole": admin_override_role,
+        },
+    )
+
     refreshed_rows = _supabase_request(
         f"/rest/v1/candidates?id=eq.{quote(candidate_id)}&select=*",
         method="GET",
@@ -1686,7 +2698,76 @@ def admin_update_candidate_interview_role(
     )
     latest_upload = uploads[0] if isinstance(uploads, list) and uploads else None
 
-    return _candidate_detail_payload(refreshed_candidate, latest_upload, slots if isinstance(slots, list) else [])
+    return _candidate_detail_payload(refreshed_candidate, latest_upload, slots if isinstance(slots, list) else [], [])
+
+
+@router.post("/admin/candidates/{candidate_id}/stage")
+@router.patch("/admin/candidates/{candidate_id}/stage")
+def admin_update_candidate_stage(
+    request_obj: Request,
+    candidate_id: str,
+    payload: AdminCandidateStagePayload,
+) -> dict[str, Any]:
+    access_token = _get_bearer_token(request_obj)
+    user = _get_supabase_user(access_token)
+    if not _is_admin(user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+
+    if payload.stage not in VALID_CANDIDATE_STAGES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid stage. Valid stages: {', '.join(VALID_CANDIDATE_STAGES)}",
+        )
+
+    candidate_rows = _supabase_request(
+        f"/rest/v1/candidates?id=eq.{quote(candidate_id)}&select=*",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+
+    if not candidate_rows:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Candidate not found")
+
+    _supabase_request(
+        f"/rest/v1/candidates?id=eq.{quote(candidate_id)}",
+        method="PATCH",
+        body={"current_stage": payload.stage},
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+
+    _record_admin_audit_log(
+        user,
+        "candidate_stage_updated",
+        "candidate",
+        candidate_id,
+        {"stage": payload.stage},
+    )
+
+    refreshed_rows = _supabase_request(
+        f"/rest/v1/candidates?id=eq.{quote(candidate_id)}&select=*",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+    refreshed_candidate = refreshed_rows[0] if isinstance(refreshed_rows, list) else refreshed_rows
+
+    uploads = _supabase_request(
+        f"/rest/v1/profile_uploads?candidate_id=eq.{quote(candidate_id)}&select=*&order=created_at.desc",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+    slots = _supabase_request(
+        f"/rest/v1/interview_slots?candidate_id=eq.{quote(candidate_id)}&select=*&order=slot_time.asc",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+    latest_upload = uploads[0] if isinstance(uploads, list) and uploads else None
+
+    return _candidate_detail_payload(refreshed_candidate, latest_upload, slots if isinstance(slots, list) else [], [])
 
 
 @router.get("/admin/interview-session/{session_id}")
@@ -1761,29 +2842,8 @@ def admin_record_hiring_outcome(
             detail="retentionDays must be between 0 and 365",
         )
 
-    candidate_rows = _supabase_request(
-        f"/rest/v1/candidates?id=eq.{quote(candidate_id)}&select=*",
-        method="GET",
-        bearer_token=settings.supabase_service_role_key,
-        use_service_role=True,
-    )
-    if not candidate_rows:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Candidate not found")
-
-    now_dt = datetime.now(UTC)
-    now_iso = now_dt.isoformat()
-    expires_at_iso = (now_dt.timestamp() + (retention_days * 86400))
-    expires_at = datetime.fromtimestamp(expires_at_iso, tz=UTC).isoformat()
-
-    # Set candidate stage based on hiring outcome.
-    next_stage = "offer_extended" if outcome == "hired" else "rejected"
-    _supabase_request(
-        f"/rest/v1/candidates?id=eq.{quote(candidate_id)}",
-        method="PATCH",
-        body={"current_stage": next_stage},
-        bearer_token=settings.supabase_service_role_key,
-        use_service_role=True,
-    )
+    now_iso = datetime.now(UTC).isoformat()
+    expires_at = (datetime.now(UTC) + timedelta(days=retention_days)).isoformat()
 
     artifact_rows = _supabase_request(
         f"/rest/v1/interview_artifacts?candidate_id=eq.{quote(candidate_id)}&select=*",
@@ -1821,6 +2881,63 @@ def admin_record_hiring_outcome(
     }
 
 
+@router.post("/admin/candidates/bulk-stage")
+@router.patch("/admin/candidates/bulk-stage")
+def admin_bulk_update_candidate_stage(
+    request_obj: Request,
+    payload: AdminBulkCandidateStagePayload,
+) -> dict[str, Any]:
+    access_token = _get_bearer_token(request_obj)
+    user = _get_supabase_user(access_token)
+    if not _is_admin(user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+
+    if payload.stage not in VALID_CANDIDATE_STAGES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid stage. Valid stages: {', '.join(VALID_CANDIDATE_STAGES)}",
+        )
+
+    candidate_ids = [candidate_id for candidate_id in payload.candidateIds if isinstance(candidate_id, str) and candidate_id.strip()]
+    if not candidate_ids:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="At least one candidate id is required")
+
+    unique_candidate_ids = list(dict.fromkeys(candidate_ids))
+    missing_candidate_ids: list[str] = []
+    updated_candidates: list[dict[str, Any]] = []
+
+    for candidate_id in unique_candidate_ids:
+        candidate_rows = _supabase_request(
+            f"/rest/v1/candidates?id=eq.{quote(candidate_id)}&select=*",
+            method="GET",
+            bearer_token=settings.supabase_service_role_key,
+            use_service_role=True,
+        )
+
+        if not candidate_rows:
+            missing_candidate_ids.append(candidate_id)
+            continue
+
+        _supabase_request(
+            f"/rest/v1/candidates?id=eq.{quote(candidate_id)}",
+            method="PATCH",
+            body={"current_stage": payload.stage},
+            bearer_token=settings.supabase_service_role_key,
+            use_service_role=True,
+        )
+        updated_candidates.append(_admin_refetch_candidate_detail(candidate_id))
+
+    if not updated_candidates and missing_candidate_ids:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No candidates were found to update")
+
+    return {
+        "updatedCount": len(updated_candidates),
+        "missingCandidateIds": missing_candidate_ids,
+        "updatedCandidates": updated_candidates,
+        "stage": payload.stage,
+    }
+
+
 @router.post("/admin/interview-artifacts/cleanup")
 def admin_cleanup_expired_interview_artifacts(
     request_obj: Request,
@@ -1837,6 +2954,27 @@ def admin_cleanup_expired_interview_artifacts(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="limit must be between 1 and 500",
         )
+
+    if payload.runInBackground:
+        _record_admin_audit_log(
+            user,
+            "interview_artifacts_cleanup_queued",
+            "interview_artifact",
+            None,
+            {"limit": limit},
+        )
+        job = _submit_background_job(
+            "cleanup_expired_interview_artifacts",
+            lambda: _admin_cleanup_expired_interview_artifacts(limit=limit, actor=user),
+            limit=limit,
+            requestedBy=user.get("id"),
+        )
+        return {"jobId": job["id"], "status": job["status"], "type": job["type"]}
+
+    return _admin_cleanup_expired_interview_artifacts(limit=limit, actor=user)
+
+
+def _admin_cleanup_expired_interview_artifacts(limit: int, actor: dict[str, Any] | None = None) -> dict[str, Any]:
 
     now_iso = datetime.now(UTC).isoformat()
     expired_artifacts = _supabase_request(
@@ -1881,7 +3019,7 @@ def admin_cleanup_expired_interview_artifacts(
                     "artifact_id": artifact_id,
                     "candidate_id": artifact.get("candidate_id"),
                     "deleted_reason": "retention_expired",
-                    "deleted_by": user.get("id"),
+                    "deleted_by": actor.get("id") if actor else None,
                 },
                 bearer_token=settings.supabase_service_role_key,
                 use_service_role=True,
@@ -1900,6 +3038,30 @@ def admin_cleanup_expired_interview_artifacts(
                 "error": str(exc),
             })
 
+    _record_admin_audit_log(
+        actor or {},
+        "interview_artifacts_cleanup_completed",
+        "interview_artifact",
+        None,
+        {
+            "evaluated": len(expired_artifacts) if isinstance(expired_artifacts, list) else 0,
+            "deletedArtifacts": deleted_rows,
+            "deletedStorageObjects": deleted_storage,
+        },
+    )
+
+    _record_admin_audit_log(
+        actor or {},
+        "interview_artifacts_cleanup_completed",
+        "interview_artifact",
+        None,
+        {
+            "evaluated": len(expired_artifacts) if isinstance(expired_artifacts, list) else 0,
+            "deletedArtifacts": deleted_rows,
+            "deletedStorageObjects": deleted_storage,
+        },
+    )
+
     return {
         "message": "Expired interview artifacts cleanup completed",
         "evaluated": len(expired_artifacts) if isinstance(expired_artifacts, list) else 0,
@@ -1916,6 +3078,26 @@ def admin_analyze_resume(request_obj: Request, candidate_id: str, payload: Resum
     if not _is_admin(user):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
 
+    if payload.runInBackground:
+        _record_admin_audit_log(
+            user,
+            "resume_analysis_queued",
+            "candidate",
+            candidate_id,
+            {"force": payload.force},
+        )
+        job = _submit_background_job(
+            "resume_analysis",
+            lambda: _admin_analyze_resume(candidate_id=candidate_id, force=payload.force, actor=user),
+            candidateId=candidate_id,
+            force=payload.force,
+        )
+        return {"jobId": job["id"], "status": job["status"], "type": job["type"]}
+
+    return _admin_analyze_resume(candidate_id=candidate_id, force=payload.force, actor=user)
+
+
+def _admin_analyze_resume(candidate_id: str, force: bool, actor: dict[str, Any] | None = None) -> dict[str, Any]:
     candidate_rows = _supabase_request(
         f"/rest/v1/candidates?id=eq.{quote(candidate_id)}&select=*",
         method="GET",
@@ -1938,11 +3120,88 @@ def admin_analyze_resume(request_obj: Request, candidate_id: str, payload: Resum
     if not latest_upload:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No resume upload found for this candidate")
 
-    if not payload.force and candidate.get("ai_summary"):
+    if not force and candidate.get("ai_summary"):
         return _candidate_detail_payload(candidate, latest_upload, [])
 
     analysis = _build_resume_analysis(candidate, latest_upload)
     _persist_candidate_analysis(candidate_id, analysis)
+    _record_admin_audit_log(
+        actor or {},
+        "resume_analysis_completed",
+        "candidate",
+        candidate_id,
+        {"force": force, "summaryGenerated": bool(analysis.get("ai_summary"))},
+    )
 
     refreshed_candidate = {**candidate, **analysis}
     return _candidate_detail_payload(refreshed_candidate, latest_upload, [])
+
+
+@router.get("/admin/background-jobs/{job_id}")
+def admin_background_job_status(request_obj: Request, job_id: str) -> dict[str, Any]:
+    access_token = _get_bearer_token(request_obj)
+    user = _get_supabase_user(access_token)
+    if not _is_admin(user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+
+    job = _get_background_job(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Background job not found")
+
+    return job
+
+
+@router.get("/admin/audit-logs")
+def admin_audit_logs(
+    request_obj: Request,
+    page: int = Query(1, ge=1),
+    pageSize: int = Query(20, ge=1, le=100),
+    action: str | None = None,
+    entityType: str | None = None,
+) -> dict[str, Any]:
+    access_token = _get_bearer_token(request_obj)
+    user = _get_supabase_user(access_token)
+    if not _is_admin(user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+
+    query_parts = ["select=*", "order=created_at.desc"]
+    if action:
+        query_parts.append(f"action=eq.{quote(action)}")
+    if entityType:
+        query_parts.append(f"entity_type=eq.{quote(entityType)}")
+
+    query_string = "&".join(query_parts)
+    logs = _supabase_request(
+        f"/rest/v1/admin_audit_logs?{query_string}",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+
+    log_rows = logs if isinstance(logs, list) else []
+    total = len(log_rows)
+    start = (page - 1) * pageSize
+    end = start + pageSize
+    paginated_logs = log_rows[start:end]
+
+    return {
+        "logs": [
+            {
+                "id": log.get("id"),
+                "action": log.get("action"),
+                "entityType": log.get("entity_type"),
+                "entityId": log.get("entity_id"),
+                "actorUserId": log.get("actor_user_id"),
+                "actorEmail": log.get("actor_email"),
+                "metadata": log.get("metadata") or {},
+                "createdAt": log.get("created_at"),
+            }
+            for log in paginated_logs
+        ],
+        "pagination": {
+            "page": page,
+            "pageSize": pageSize,
+            "total": total,
+            "totalPages": max(1, (total + pageSize - 1) // pageSize),
+        },
+    }

@@ -2,19 +2,28 @@
 
 ## Setup
 
-1. Create and activate a virtual environment.
+1. Create and activate a virtual environment:
+   python -m venv .venv
+   .\.venv\Scripts\Activate.ps1
 2. Install dependencies:
-   pip install -r requirements.txt
+   .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 3. Copy environment file:
    copy .env.example .env
 4. Run server:
-   uvicorn run:app --reload --port 8000
+   .\.venv\Scripts\python.exe -m uvicorn run:app --reload --port 8000
 
 ## API Endpoints
 
 - GET /            -> basic API message
 - GET /health      -> health check
 - POST /candidate/profile-upload -> saves upload metadata in Supabase
+- POST /candidate/interview-session/start -> starts candidate interview session
+- POST /candidate/interview-session/{session_id}/complete -> completes session and stores scoring state
+- POST /candidate/interview-session/{session_id}/score/retry -> candidate retry scoring
+- POST/PATCH /admin/candidates/{candidate_id}/stage -> update candidate stage
+- POST/PATCH /admin/candidates/bulk-stage -> bulk update candidate stages
+- GET /admin/background-jobs/{job_id} -> background job status
+- GET /admin/audit-logs -> admin audit log listing
 
 ## Frontend Integration
 
@@ -47,4 +56,4 @@ The resume analysis endpoint uses OpenAI when `OPENAI_API_KEY` is set.
 - Default model: `gpt-4o-mini`
 - Keep requests short by extracting only the relevant resume text before sending it to the model
 - Review OpenAI pricing and rate limits before enabling production traffic
-- The backend falls back to a deterministic heuristic score if OpenAI is unavailable
+- Scoring is strict LLM-based, with retry/backoff and pending status handling instead of heuristic fallback

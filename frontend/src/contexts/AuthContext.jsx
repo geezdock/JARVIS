@@ -1,7 +1,8 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
-import { supabase } from '../lib/supabase';
+import { hasSupabaseConfig, supabase, supabaseConfigError } from '../lib/supabase';
 
 const AuthContext = createContext({});
+const INTERVIEW_LOCK_STORAGE_KEY = 'jarvis.interviewLock';
 
 const deriveRole = (user) => {
   if (!user) return null;
@@ -45,9 +46,56 @@ export const AuthProvider = ({ children }) => {
   const [role, setRole] = useState(null);
   const [displayName, setDisplayName] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [interviewLock, setInterviewLock] = useState(() => {
+    try {
+      const raw = window.sessionStorage.getItem(INTERVIEW_LOCK_STORAGE_KEY);
+      if (!raw) {
+        return null;
+      }
+      const parsed = JSON.parse(raw);
+      if (!parsed || !parsed.active || !parsed.sessionId) {
+        return null;
+      }
+      return {
+        active: true,
+        sessionId: String(parsed.sessionId),
+        startedAt: parsed.startedAt || new Date().toISOString(),
+      };
+    } catch (_error) {
+      return null;
+    }
+  });
+
+  const persistInterviewLock = (value) => {
+    if (!value || !value.active) {
+      window.sessionStorage.removeItem(INTERVIEW_LOCK_STORAGE_KEY);
+      return;
+    }
+    window.sessionStorage.setItem(INTERVIEW_LOCK_STORAGE_KEY, JSON.stringify(value));
+  };
+
+  const startInterviewLock = (sessionId) => {
+    const lock = {
+      active: true,
+      sessionId: String(sessionId),
+      startedAt: new Date().toISOString(),
+    };
+    setInterviewLock(lock);
+    persistInterviewLock(lock);
+  };
+
+  const clearInterviewLock = () => {
+    setInterviewLock(null);
+    persistInterviewLock(null);
+  };
 
   useEffect(() => {
     const initializeAuth = async () => {
+      if (!hasSupabaseConfig) {
+        setLoading(false);
+        return;
+      }
+
       try {
         const {
           data: { session },
@@ -70,6 +118,10 @@ export const AuthProvider = ({ children }) => {
 
     initializeAuth();
 
+    if (!hasSupabaseConfig) {
+      return () => {};
+    }
+
     const {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((_event, session) => {
@@ -85,6 +137,10 @@ export const AuthProvider = ({ children }) => {
   }, []);
 
   const login = async (email, password) => {
+    if (!hasSupabaseConfig) {
+      throw new Error(supabaseConfigError);
+    }
+
     setLoading(true);
     const { data, error } = await supabase.auth.signInWithPassword({
       email,
@@ -102,6 +158,10 @@ export const AuthProvider = ({ children }) => {
     firstName = '',
     lastName = '',
   }) => {
+    if (!hasSupabaseConfig) {
+      throw new Error(supabaseConfigError);
+    }
+
     setLoading(true);
     const { data, error } = await supabase.auth.signUp({
       email,
@@ -121,6 +181,10 @@ export const AuthProvider = ({ children }) => {
   };
 
   const logout = async () => {
+    if (!hasSupabaseConfig) {
+      throw new Error(supabaseConfigError);
+    }
+
     setLoading(true);
     const { error } = await supabase.auth.signOut();
     setLoading(false);
@@ -134,6 +198,9 @@ export const AuthProvider = ({ children }) => {
     isAdmin: role === 'admin',
     isCandidate: role === 'candidate',
     loading,
+    interviewLock,
+    startInterviewLock,
+    clearInterviewLock,
     login,
     signup,
     logout,

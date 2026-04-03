@@ -18,6 +18,7 @@ class Settings:
     supabase_db_url: str = os.getenv("SUPABASE_DB_URL", "")
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
     openai_model: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    interview_ai_output_mode: str = os.getenv("INTERVIEW_AI_OUTPUT_MODE", "browser_tts")
 
 
 settings = Settings()

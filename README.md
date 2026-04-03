@@ -9,6 +9,10 @@ The current implementation includes:
 - Resume upload, interview start, and admin review flows
 - AI resume summarization support in the admin detail view
 - Interview role routing with candidate input, admin override, and fallback inference
+- Browser-based interview recording with private artifact storage and admin playback
+- Strict LLM-based interview scoring with retry handling
+- Admin search/filter/sort, stage updates, and bulk stage operations
+- Backend pytest coverage for health/admin/audit/background-job paths
 
 ## What Is Working Now
 
@@ -21,6 +25,11 @@ The current implementation includes:
 - Admin candidate detail analysis with extracted skills and summary
 - Resolved interview role fallback: admin override -> candidate target role -> resume inference
 - Role-specific interview flow and starter question set for candidates
+- Interview session recording, transcript autosave, and admin playback timeline
+- Strict three-part scoring model (resume/interview/behavior) with reliability retry layer
+- Admin candidate search, stage filtering, score sorting, pagination, and bulk stage updates
+- Background-job execution mode for selected admin actions
+- Audit log capture and paginated retrieval endpoint
 
 ## Project Layout
 
@@ -47,6 +56,8 @@ JARVIS/
   - Candidate dashboard with search
   - Candidate detail view with resume and AI summary cards
   - Interview role controls (target role and admin override)
+  - Stage update controls and bulk stage actions
+  - Pagination and score sort controls
 - UI polish with Tailwind CSS, Framer Motion, and toast notifications
 
 ### Backend
@@ -57,8 +68,15 @@ JARVIS/
 - `POST /candidate/profile-upload` persists upload metadata in Supabase
 - `POST /candidate/storage/signed-upload` creates storage signed upload URLs
 - `POST /candidate/interview-slots` starts interview and returns role-based interview plan
+- `POST /candidate/interview-session/start` starts an interview session
+- `POST /candidate/interview-session/{session_id}/complete` completes session and scoring flow
+- `POST /candidate/interview-session/{session_id}/score/retry` retries scoring for candidate-owned session
 - `POST /admin/analyze-resume/{candidate_id}` generates and stores resume analysis
-- `PATCH /admin/candidates/{candidate_id}/interview-role` saves target/override interview role
+- `POST/PATCH /admin/candidates/{candidate_id}/interview-role` saves target/override interview role
+- `POST/PATCH /admin/candidates/{candidate_id}/stage` updates candidate pipeline stage
+- `POST/PATCH /admin/candidates/bulk-stage` bulk updates stages for selected candidates
+- `GET /admin/background-jobs/{job_id}` checks async background-job status
+- `GET /admin/audit-logs` fetches paginated admin audit logs
 - Backend config supports Supabase URL, anon key, service role key, and database URL
 
 ### Supabase
@@ -81,10 +99,10 @@ JARVIS/
 ```powershell
 cd frontend
 npm install
-npm run dev
+npm run dev -- --port 5173
 ```
 
-Frontend URL: `http://localhost:5173`
+Frontend URL: `http://localhost:5173` (or next available port shown by Vite)
 
 ### 2. Backend
 
@@ -94,7 +112,7 @@ python -m venv .venv
 .\.venv\Scripts\activate
 pip install -r requirements.txt
 copy .env.example .env
-python -m uvicorn app.main:app --reload --port 8000
+.\.venv\Scripts\python.exe -m uvicorn run:app --reload --port 8000
 ```
 
 Backend URL: `http://localhost:8000`
@@ -133,6 +151,13 @@ cd frontend
 npm run build
 ```
 
+## Run Backend Tests
+
+```powershell
+cd backend
+.\.venv\Scripts\python.exe -m pytest -q
+```
+
 ## Troubleshooting
 
 ### ENOENT: package.json not found
@@ -141,6 +166,24 @@ If you run `npm` from the repo root, use the frontend folder explicitly:
 
 ```powershell
 npm --prefix frontend run dev
+```
+
+### Address already in use (backend/frontend)
+
+If a port is already occupied, either stop the process using it or start on another port.
+
+Backend example:
+
+```powershell
+cd backend
+.\.venv\Scripts\python.exe -m uvicorn run:app --reload --port 8001
+```
+
+Frontend example:
+
+```powershell
+cd frontend
+npm run dev -- --port 5176
 ```
 
 ### Supabase REST root returns 401
@@ -153,7 +196,7 @@ GET /rest/v1/candidates?select=*
 
 ## Next Steps
 
-- Phase 8: add video interview recording and storage playback
-- Add stage-management APIs and richer admin filters
-- Add automated tests for backend and frontend critical flows
-- Add deployment docs and CI/CD pipeline
+- Phase 10: email and notification workflows (provider + stage-based triggers)
+- Expand tests to frontend integration/component coverage
+- Add deployment docs, containerization, and CI/CD pipeline
+- Improve production hardening: rate limiting, monitoring, and caching strategy
