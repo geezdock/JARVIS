@@ -31,6 +31,47 @@ export default function AdminDashboard() {
   const [loadError, setLoadError] = useState('');
   const [searchApplying, setSearchApplying] = useState(false);
   const [bulkApplying, setBulkApplying] = useState(false);
+  const [bulkJob, setBulkJob] = useState(null);
+
+  useEffect(() => {
+    if (!bulkJob?.id || !['queued', 'running'].includes(bulkJob.status)) {
+      return undefined;
+    }
+
+    const intervalId = window.setInterval(async () => {
+      try {
+        const response = await api.get(`/admin/background-jobs/${bulkJob.id}`);
+        const job = response.data;
+        setBulkJob(job);
+
+        if (job.status === 'completed') {
+          window.clearInterval(intervalId);
+          setBulkApplying(false);
+          await fetchCandidates();
+
+          const result = job.result || {};
+          if (job.type === 'candidate_bulk_stage_update') {
+            toast.success(`Bulk stage update completed: ${result.updatedCount || 0} updated`);
+          } else {
+            toast.success('Bulk job completed');
+          }
+        }
+
+        if (job.status === 'failed') {
+          window.clearInterval(intervalId);
+          setBulkApplying(false);
+          toast.error(job.error || 'Bulk job failed');
+        }
+      } catch (error) {
+        window.clearInterval(intervalId);
+        setBulkApplying(false);
+        setBulkJob(null);
+        toast.error(error.message || 'Unable to fetch bulk job status');
+      }
+    }, 1500);
+
+    return () => window.clearInterval(intervalId);
+  }, [bulkJob?.id, bulkJob?.status]);
 
   const fetchCandidates = async () => {
     try {
@@ -117,17 +158,18 @@ export default function AdminDashboard() {
 
     try {
       setBulkApplying(true);
-      await api.post('/admin/candidates/bulk-stage', {
+      const response = await api.post('/admin/candidates/bulk-stage', {
         candidateIds: selectedCandidateIds,
         stage: bulkStage,
+        runInBackground: true,
       });
+      setBulkJob(response.data || null);
       setSelectedCandidateIds([]);
-      await fetchCandidates();
-      toast.success('Selected candidates updated');
+      toast.success('Bulk stage update queued');
     } catch (error) {
       toast.error(error.message || 'Unable to update selected candidates');
-    } finally {
       setBulkApplying(false);
+      setBulkJob(null);
     }
   };
 
@@ -300,11 +342,29 @@ export default function AdminDashboard() {
                       disabled={!selectedCandidateIds.length || bulkApplying}
                       className="w-full"
                     >
-                      {bulkApplying ? 'Updating...' : 'Update Selected'}
+                      {bulkApplying ? 'Running...' : 'Update Selected'}
                     </Button>
                   </div>
                 </div>
               </div>
+
+              {bulkJob ? (
+                <div className="mt-4 rounded-lg border border-teal-200 bg-white p-3">
+                  <div className="mb-2 flex items-center justify-between text-xs font-semibold text-teal-800">
+                    <span>Bulk job: {bulkJob.type?.replaceAll('_', ' ') || 'unknown'}</span>
+                    <span className="uppercase">{bulkJob.status}</span>
+                  </div>
+                  <div className="h-2 w-full overflow-hidden rounded-full bg-slate-200">
+                    <div
+                      className="h-full rounded-full bg-teal-600 transition-all"
+                      style={{ width: `${bulkJob.progress?.percent || (bulkJob.status === 'completed' ? 100 : 0)}%` }}
+                    />
+                  </div>
+                  <p className="mt-2 text-xs text-slate-600">
+                    {bulkJob.progress?.processed || 0} / {bulkJob.progress?.total || bulkJob.context?.candidateCount || 0} processed
+                  </p>
+                </div>
+              ) : null}
             </div>
           </div>
         </div>

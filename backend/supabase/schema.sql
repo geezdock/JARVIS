@@ -40,6 +40,28 @@ create table if not exists public.profile_uploads (
   created_at timestamptz not null default now()
 );
 
+create table if not exists public.job_specifications (
+  id uuid primary key default gen_random_uuid(),
+  candidate_id uuid not null references public.candidates(id) on delete cascade,
+  user_id uuid not null,
+  file_name text not null,
+  file_path text,
+  file_url text,
+  mime_type text,
+  file_size bigint,
+  raw_text text,
+  parsed_data jsonb,
+  status text not null default 'uploaded',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+alter table public.job_specifications
+  add column if not exists parsed_data jsonb;
+
+alter table public.job_specifications
+  add column if not exists raw_text text;
+
 create table if not exists public.interview_slots (
   id uuid primary key default gen_random_uuid(),
   candidate_id uuid not null references public.candidates(id) on delete cascade,

@@ -196,7 +196,6 @@ GET /rest/v1/candidates?select=*
 
 ## Next Steps
 
-- Phase 10: email and notification workflows (provider + stage-based triggers)
 - Expand tests to frontend integration/component coverage
 - Add deployment docs, containerization, and CI/CD pipeline
 - Improve production hardening: rate limiting, monitoring, and caching strategy

@@ -77,6 +77,13 @@ All endpoints built and Supabase-integrated:
 - ✅ Admin UI status badges and manual retry buttons
 - ✅ Graceful handling of service unavailability
 
+#### Phase 9: Search, Filter & Admin Features (DONE)
+- ✅ Candidate search and stage filtering
+- ✅ Candidate stage management and validation
+- ✅ Bulk stage updates with progress indicator
+- ✅ Admin candidate pagination and score sorting
+- ✅ Admin audit logging for key actions
+
 ---
 
 ## 🚀 NEXT PRIORITIES (Ordered by Sequence)
@@ -306,7 +313,7 @@ All endpoints built and Supabase-integrated:
 
 ---
 
-### Phase 9: Search, Filter & Admin Features [92% - IN PROGRESS]
+### Phase 9: Search, Filter & Admin Features [100% - DONE]
 
 **Goal:** Add advanced admin capabilities for candidate management and filtering.
 
@@ -325,10 +332,9 @@ All endpoints built and Supabase-integrated:
 - [x] Display pipeline stages and current stage selection
 - [x] Real-time stage updates with toast notifications
 
-#### 9.3 Bulk Operations [75% - IN PROGRESS]
+#### 9.3 Bulk Operations [100% - DONE]
 - [x] Allow admins to multi-select candidates and bulk update stage
-- [ ] Bulk operations for sending emails (requires Phase 10)
-- [ ] Progress indicator for bulk operations
+- [x] Progress indicator for bulk operations
 
 **Dependencies:** Phase 7.5 (Role-Aware Routing)
 
@@ -346,31 +352,6 @@ All endpoints built and Supabase-integrated:
 - Frontend builds: ✓ (2241 modules)
 - No type/syntax errors: ✓
 
----
-
-### Phase 10: Email & Notifications [0% - NOT STARTED]
-
-**Goal:** Keep candidates informed of status changes.
-
-#### 10.1 Email Setup
-- [ ] Choose provider: SendGrid, Mailgun, AWS SES, or Supabase built-in emails
-- [ ] Add service credentials to [backend/.env.example](backend/.env.example)
-- [ ] Create email template service in backend
-
-#### 10.2 Email Triggers
-- [ ] Send welcome email on signup
-- [ ] Send notification when interview slot is scheduled
-- [ ] Send notification when stage changes (e.g., "Your application has been reviewed")
-- [ ] Send rejection/offer email when applicable
-
-#### 10.3 Toast & In-App Notifications
-- [ ] Add real-time notifications to frontend (already has toast component)
-- [ ] Emit socket events or polling for live updates
-
-**Dependencies:** All previous phases
-
----
-
 ### Phase 11: Testing [35% - IN PROGRESS]
 
 #### 11.1 Backend Tests
@@ -385,7 +366,7 @@ All endpoints built and Supabase-integrated:
 - [ ] API integration tests
 - [ ] Form validation tests
 
-**Dependencies:** All functionality complete (Phases 6-10)
+**Dependencies:** All functionality complete (Phases 6-9)
 
 ---
 
@@ -450,11 +431,10 @@ All endpoints built and Supabase-integrated:
 | **Admin Scoring UI** | ✅ Complete | Status pills, retry buttons, error messages in dashboard |
 | **Search & Filters** | ✅ Complete | Advanced search, stage filter, score sort on dashboard |
 | **Stage Management** | ✅ Complete | Update candidate stage with validation and pipeline display |
-| **Bulk Operations** | ✅ In Progress | Multi-select bulk stage updates complete; email bulk ops deferred |
+| **Bulk Operations** | ✅ Complete | Multi-select bulk stage updates complete |
 | **Audit Logs** | ✅ Complete | Admin actions are recorded and queryable |
 | **Background Jobs** | ✅ Complete | Resume analysis and artifact cleanup can run asynchronously |
 | **Bundle Splitting** | ✅ Complete | Route-level lazy loading reduces the main frontend bundle |
-| **Email Notifications** | ❌ Not Started | No email integration |
 | **Testing** | ✅ In Progress | Backend pytest suite added; frontend tests pending |
 | **Deployment** | ❌ Not Started | Development setup only |
 
@@ -503,4 +483,4 @@ cd backend
 - CORS is configured for frontend origin in [backend/app/main.py](backend/app/main.py)
 - Session bootstrap ensures user is logged in before rendering protected pages
 - Current bulk-stage API supports POST and PATCH for compatibility; frontend uses POST
-- Remaining near-term gap in admin workflow is bulk-operation progress visibility and email actions (Phase 10)
+

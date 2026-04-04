@@ -43,30 +43,18 @@ const uploadBlobToSignedUrl = async (blob, sessionId, fileType = 'video', extens
     throw new Error('Upload authorization is incomplete');
   }
 
-  await new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    const formData = new FormData();
-
-    xhr.open('PUT', signedUrl, true);
-    xhr.setRequestHeader('x-upsert', 'false');
-
-    formData.append('cacheControl', '3600');
-    formData.append('', blob);
-
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        resolve();
-        return;
-      }
-      reject(new Error('Failed to upload interview recording'));
-    };
-
-    xhr.onerror = () => {
-      reject(new Error('Network error during interview upload'));
-    };
-
-    xhr.send(formData);
+  const uploadResponse = await fetch(signedUrl, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': blob.type || 'video/webm',
+      'x-upsert': 'false',
+    },
+    body: blob,
   });
+
+  if (!uploadResponse.ok) {
+    throw new Error('Failed to upload interview recording');
+  }
 
   return {
     path,

@@ -1,6 +1,7 @@
 from datetime import datetime, UTC, timedelta
 from concurrent.futures import ThreadPoolExecutor
 import io
+import inspect
 import json
 import re
 import secrets
@@ -31,6 +32,15 @@ class ProfileUploadPayload(BaseModel):
     submittedAt: str
 
 
+class JobSpecificationPayload(BaseModel):
+    filename: str
+    size: int
+    type: str
+    filePath: str | None = None
+    fileUrl: str | None = None
+    submittedAt: str
+
+
 class InterviewSlotPayload(BaseModel):
     slotTime: str
 
@@ -57,6 +67,7 @@ class AdminCandidateStagePayload(BaseModel):
 class AdminBulkCandidateStagePayload(BaseModel):
     candidateIds: list[str]
     stage: str
+    runInBackground: bool = False
 
 
 class AdminInterviewRolePayload(BaseModel):
@@ -177,7 +188,12 @@ def _resolve_interview_role(candidate: dict[str, Any], inferred_role: str | None
     return "General Candidate", "default"
 
 
-def _build_role_specific_interview_plan(interview_role: str) -> dict[str, Any]:
+def _build_role_specific_interview_plan(interview_role: str, job_spec: dict[str, Any] | None = None) -> dict[str, Any]:
+    """
+    Build a role-specific interview plan, optionally enhanced with job specification details.
+    
+    If job_spec is provided, generates dynamic questions tailored to the specific role requirements.
+    """
     flow_by_role: dict[str, dict[str, Any]] = {
         "Frontend Developer": {
             "flow": ["UI foundations", "React architecture", "State management", "Debugging"],
@@ -238,11 +254,26 @@ def _build_role_specific_interview_plan(interview_role: str) -> dict[str, Any]:
     }
 
     plan = flow_by_role.get(interview_role, flow_by_role["General Candidate"])
-    return {
+    base_plan = {
         "role": interview_role,
         "flow": plan["flow"],
         "questions": plan["questions"],
     }
+
+    # Enhance plan with job specification if available
+    if job_spec and isinstance(job_spec, dict):
+        base_plan["job_context"] = {
+            "title": job_spec.get("job_title"),
+            "department": job_spec.get("department"),
+            "seniority": job_spec.get("seniority_level"),
+            "required_skills": job_spec.get("required_skills", []),
+            "nice_to_have_skills": job_spec.get("nice_to_have_skills", []),
+            "key_responsibilities": job_spec.get("key_responsibilities", []),
+        }
+        # In a future enhancement, we can generate dynamic questions using the job spec
+        # For now, we include the job context for the interviewer reference
+    
+    return base_plan
 
 
 def _supabase_request(
@@ -737,6 +768,43 @@ def _build_resume_prompt(
     )
 
 
+def _extract_openai_error(raw_error: str) -> tuple[str | None, str | None]:
+    if not raw_error:
+        return None, None
+
+    try:
+        parsed = json.loads(raw_error)
+    except Exception:
+        normalized = raw_error.lower()
+        if "insufficient_quota" in normalized:
+            return "insufficient_quota", None
+        return None, raw_error
+
+    if not isinstance(parsed, dict):
+        return None, raw_error
+
+    error_obj = parsed.get("error")
+    if isinstance(error_obj, dict):
+        code = error_obj.get("code") if isinstance(error_obj.get("code"), str) else None
+        message = error_obj.get("message") if isinstance(error_obj.get("message"), str) else None
+        return code, message
+
+    return None, raw_error
+
+
+def _friendly_scoring_error_message(raw_message: str | None) -> str:
+    normalized = (raw_message or "").lower()
+
+    if "insufficient_quota" in normalized or "quota" in normalized or "billing" in normalized:
+        return "Scoring provider quota exceeded. Please retry later or contact support."
+    if "openai_api_key is not configured" in normalized:
+        return "Scoring provider is not configured. Please contact support."
+    if "invalid api key" in normalized or "authentication" in normalized:
+        return "Scoring provider authentication failed. Please contact support."
+
+    return "Scoring provider unavailable. Please try again shortly."
+
+
 def _openai_chat_completion_with_retry(payload: dict[str, Any], timeout_seconds: int = 60) -> dict[str, Any]:
     if not settings.openai_api_key:
         raise SupabaseError("OPENAI_API_KEY is not configured")
@@ -769,12 +837,15 @@ def _openai_chat_completion_with_retry(payload: dict[str, Any], timeout_seconds:
             if attempt < max_attempts - 1 and retryable:
                 time.sleep(backoff_seconds[attempt])
                 continue
-            raise SupabaseError(raw_error or exc.reason) from exc
+            error_code, error_message = _extract_openai_error(raw_error)
+            if error_code == "insufficient_quota":
+                raise SupabaseError("Scoring provider quota exceeded. Please retry later.") from exc
+            raise SupabaseError(_friendly_scoring_error_message(error_message or raw_error or str(exc.reason))) from exc
         except Exception as exc:
             if attempt < max_attempts - 1:
                 time.sleep(backoff_seconds[attempt])
                 continue
-            raise SupabaseError(f"OpenAI request failed: {exc}") from exc
+            raise SupabaseError(_friendly_scoring_error_message(str(exc))) from exc
 
     raise SupabaseError("OpenAI request failed after retries")
 
@@ -794,6 +865,13 @@ def _ensure_openai_scoring_ready() -> None:
         "max_tokens": 20,
     }
     _openai_chat_completion_with_retry(preflight_payload, timeout_seconds=30)
+
+
+def _to_scoring_provider_http_exception(exc: Exception) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=_friendly_scoring_error_message(str(exc)),
+    )
 
 
 def _openai_resume_analysis(
@@ -894,6 +972,77 @@ def _persist_candidate_analysis(candidate_id: str, analysis: dict[str, Any]) -> 
         bearer_token=settings.supabase_service_role_key,
         use_service_role=True,
     )
+
+
+def _parse_job_specification(raw_text: str) -> dict[str, Any]:
+    """
+    Parse raw job specification text into structured JSON using OpenAI.
+    Returns a dict with required_skills, nice_to_have_skills, seniority, responsibilities, evaluation_rubric.
+    """
+    if not settings.openai_api_key:
+        raise SupabaseError("OPENAI_API_KEY is not configured")
+    
+    if not raw_text or not raw_text.strip():
+        raise ValueError("Job specification text is empty")
+    
+    prompt = f"""Analyze the following job specification and extract structured information.
+Return ONLY valid JSON (no markdown, no extra text) with these exact fields:
+
+{{
+  "job_title": "string",
+  "required_skills": ["string"],
+  "nice_to_have_skills": ["string"],
+  "seniority_level": "Junior|Mid-level|Senior|Lead",
+  "department": "string",
+  "key_responsibilities": ["string"],
+  "evaluation_rubric": {{
+    "technical_fit": "description",
+    "experience_fit": "description",
+    "communication_fit": "description",
+    "domain_knowledge": "description"
+  }},
+  "min_years_experience": integer,
+  "max_years_experience": integer,
+  "salary_range": "string or null",
+  "summary": "string"
+}}
+
+Job Specification:
+{raw_text}"""
+
+    payload = {
+        "model": settings.openai_model,
+        "messages": [
+            {"role": "system", "content": "You are a job specification analyzer. Extract structured data and respond with strict JSON only—no markdown, no additional text."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.3,
+        "response_format": {"type": "json_object"},
+    }
+
+    try:
+        data = _openai_chat_completion_with_retry(payload, timeout_seconds=45)
+        content = (((data.get("choices") or [])[0] or {}).get("message") or {}).get("content")
+        
+        if not isinstance(content, str) or not content.strip():
+            raise SupabaseError("OpenAI returned empty job spec analysis")
+        
+        parsed = json.loads(content)
+        return {
+            "job_title": str(parsed.get("job_title", "Unknown Position")).strip(),
+            "required_skills": parsed.get("required_skills", []) if isinstance(parsed.get("required_skills"), list) else [],
+            "nice_to_have_skills": parsed.get("nice_to_have_skills", []) if isinstance(parsed.get("nice_to_have_skills"), list) else [],
+            "seniority_level": str(parsed.get("seniority_level", "Mid-level")).strip(),
+            "department": str(parsed.get("department", "")).strip(),
+            "key_responsibilities": parsed.get("key_responsibilities", []) if isinstance(parsed.get("key_responsibilities"), list) else [],
+            "evaluation_rubric": parsed.get("evaluation_rubric", {}) if isinstance(parsed.get("evaluation_rubric"), dict) else {},
+            "min_years_experience": parsed.get("min_years_experience"),
+            "max_years_experience": parsed.get("max_years_experience"),
+            "salary_range": parsed.get("salary_range"),
+            "summary": str(parsed.get("summary", "")).strip(),
+        }
+    except json.JSONDecodeError as e:
+        raise SupabaseError(f"Failed to parse job specification: {str(e)}")
 
 
 def _clamp_component_score(value: Any) -> int:
@@ -1227,7 +1376,16 @@ def _submit_background_job(job_type: str, handler, **context: Any) -> dict[str, 
     def _runner() -> None:
         _store_background_job(job_id, {"status": "running", "updatedAt": datetime.now(UTC).isoformat()})
         try:
-            result = handler()
+            try:
+                signature = inspect.signature(handler)
+                expects_job_id = len(signature.parameters) > 0
+            except (TypeError, ValueError):
+                expects_job_id = False
+
+            if expects_job_id:
+                result = handler(job_id)
+            else:
+                result = handler()
             _store_background_job(
                 job_id,
                 {
@@ -1410,6 +1568,7 @@ def candidate_interview_slots_create(request_obj: Request, payload: InterviewSlo
     interview_plan = _build_role_specific_interview_plan(interview_role)
 
     created = created_rows[0] if isinstance(created_rows, list) else created_rows
+
     return {
         "message": "Interview started",
         "startedAt": started_at,
@@ -1434,10 +1593,7 @@ def candidate_interview_session_start(
     try:
         _ensure_openai_scoring_ready()
     except SupabaseError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Scoring provider unavailable. Please try again shortly. ({exc})",
-        ) from exc
+        raise _to_scoring_provider_http_exception(exc) from exc
 
     access_token = _get_bearer_token(request_obj)
     user = _get_supabase_user(access_token)
@@ -1453,6 +1609,19 @@ def candidate_interview_session_start(
     existing_session = existing_sessions[0] if isinstance(existing_sessions, list) and existing_sessions else None
     if existing_session:
         if existing_session.get("status") == "in_progress":
+            # Fetch job spec for existing in-progress session
+            job_specs = _supabase_request(
+                f"/rest/v1/job_specifications?candidate_id=eq.{quote(candidate['id'])}&select=*&order=created_at.desc&limit=1",
+                method="GET",
+                bearer_token=settings.supabase_service_role_key,
+                use_service_role=True,
+            )
+            latest_job_spec = None
+            if job_specs and isinstance(job_specs, list) and job_specs:
+                latest_job_spec_record = job_specs[0]
+                if latest_job_spec_record.get("parsed_data") and isinstance(latest_job_spec_record.get("parsed_data"), dict):
+                    latest_job_spec = latest_job_spec_record.get("parsed_data")
+            
             return {
                 "message": "Interview session already in progress",
                 "session": existing_session,
@@ -1460,7 +1629,8 @@ def candidate_interview_session_start(
                 "interviewRole": existing_session.get("interview_role") or _resolve_interview_role(candidate)[0],
                 "interviewRoleSource": existing_session.get("role_source") or _resolve_interview_role(candidate)[1],
                 "interviewPlan": _build_role_specific_interview_plan(
-                    existing_session.get("interview_role") or _resolve_interview_role(candidate)[0]
+                    existing_session.get("interview_role") or _resolve_interview_role(candidate)[0],
+                    latest_job_spec
                 ),
                 "resumeSummary": candidate.get("ai_summary") or "Resume summary pending. Ask structured role-fit questions.",
                 "realtime": None,
@@ -1488,7 +1658,21 @@ def candidate_interview_session_start(
             inferred_role = None
 
     interview_role, role_source = _resolve_interview_role(candidate, inferred_role)
-    interview_plan = _build_role_specific_interview_plan(interview_role)
+    
+    # Fetch the latest job specification if available
+    job_specs = _supabase_request(
+        f"/rest/v1/job_specifications?candidate_id=eq.{quote(candidate['id'])}&select=*&order=created_at.desc&limit=1",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+    latest_job_spec = None
+    if job_specs and isinstance(job_specs, list) and job_specs:
+        latest_job_spec_record = job_specs[0]
+        if latest_job_spec_record.get("parsed_data") and isinstance(latest_job_spec_record.get("parsed_data"), dict):
+            latest_job_spec = latest_job_spec_record.get("parsed_data")
+    
+    interview_plan = _build_role_specific_interview_plan(interview_role, latest_job_spec)
 
     started_at = datetime.now(UTC).isoformat()
     slot_rows = _supabase_request(
@@ -2000,7 +2184,7 @@ def candidate_interview_session_complete(
         )
     except Exception as exc:
         scoring_status = "pending"
-        scoring_error = str(exc)
+        scoring_error = _friendly_scoring_error_message(str(exc))
 
     final_score_payload = {
         **incoming_score_payload,
@@ -2114,7 +2298,84 @@ def candidate_profile_upload(request_obj: Request, payload: ProfileUploadPayload
     }
 
 
-@router.post("/candidate/interview-session/{session_id}/score/retry")
+@router.post("/candidate/job-specification-upload")
+def candidate_job_specification_upload(request_obj: Request, payload: JobSpecificationPayload) -> dict[str, object]:
+    access_token = _get_bearer_token(request_obj)
+    user = _get_supabase_user(access_token)
+    user_id = user["id"]
+    candidate = _get_or_create_candidate(user)
+
+    uploaded_rows = _supabase_request(
+        "/rest/v1/job_specifications?select=*",
+        method="POST",
+        body={
+            "candidate_id": candidate["id"],
+            "user_id": user_id,
+            "file_name": payload.filename,
+            "file_path": payload.filePath,
+            "file_url": payload.fileUrl,
+            "mime_type": payload.type,
+            "file_size": payload.size,
+            "status": "uploaded",
+        },
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+
+    uploaded = uploaded_rows[0] if isinstance(uploaded_rows, list) else uploaded_rows
+    job_spec_id = uploaded.get("id")
+
+    # Extract and parse the job specification asynchronously
+    def parse_job_spec_async():
+        try:
+            file_url = payload.fileUrl
+            extracted_text = ""
+            
+            if isinstance(file_url, str) and file_url:
+                try:
+                    extracted_text = _extract_pdf_text(_download_url_bytes(file_url))
+                except Exception:
+                    extracted_text = ""
+            
+            if not extracted_text.strip():
+                raise ValueError("Could not extract text from job specification PDF")
+            
+            parsed_data = _parse_job_specification(extracted_text)
+            
+            # Update the job spec record with parsed data and raw text
+            _supabase_request(
+                f"/rest/v1/job_specifications?id=eq.{quote(job_spec_id)}",
+                method="PATCH",
+                body={
+                    "raw_text": extracted_text,
+                    "parsed_data": parsed_data,
+                    "status": "parsed",
+                },
+                bearer_token=settings.supabase_service_role_key,
+                use_service_role=True,
+            )
+        except Exception as e:
+            print(f"Error parsing job specification {job_spec_id}: {str(e)}")
+            _supabase_request(
+                f"/rest/v1/job_specifications?id=eq.{quote(job_spec_id)}",
+                method="PATCH",
+                body={"status": "error"},
+                bearer_token=settings.supabase_service_role_key,
+                use_service_role=True,
+            )
+
+    # Run parsing in background thread
+    thread = threading.Thread(target=parse_job_spec_async, daemon=True)
+    thread.start()
+
+    return {
+        "message": "Job specification uploaded and queued for parsing",
+        "candidate": candidate,
+        "upload": uploaded,
+        "jobSpecId": job_spec_id,
+        "receivedAt": datetime.now(UTC).isoformat(),
+        "submittedAt": payload.submittedAt,
+    }
 def candidate_interview_session_retry_scoring(request_obj: Request, session_id: str) -> dict[str, Any]:
     access_token = _get_bearer_token(request_obj)
     user = _get_supabase_user(access_token)
@@ -2153,15 +2414,18 @@ def candidate_interview_session_retry_scoring(request_obj: Request, session_id: 
     resume_score = candidate.get("ai_score") if isinstance(candidate.get("ai_score"), int) else 70
     duration_seconds = session_row.get("duration_seconds") if isinstance(session_row.get("duration_seconds"), int) else None
 
-    scoring = _build_interview_scoring_rubric(
-        transcript_text,
-        transcript_turns,
-        duration_seconds,
-        total_questions,
-        resume_score,
-        interview_role,
-        interview_plan,
-    )
+    try:
+        scoring = _build_interview_scoring_rubric(
+            transcript_text,
+            transcript_turns,
+            duration_seconds,
+            total_questions,
+            resume_score,
+            interview_role,
+            interview_plan,
+        )
+    except Exception as exc:
+        raise _to_scoring_provider_http_exception(exc) from exc
 
     updated_payload = {
         **score_payload,
@@ -2248,15 +2512,18 @@ def admin_interview_session_retry_scoring(request_obj: Request, session_id: str)
     resume_score = candidate.get("ai_score") if isinstance(candidate.get("ai_score"), int) else 70
     duration_seconds = session_row.get("duration_seconds") if isinstance(session_row.get("duration_seconds"), int) else None
 
-    scoring = _build_interview_scoring_rubric(
-        transcript_text,
-        transcript_turns,
-        duration_seconds,
-        total_questions,
-        resume_score,
-        interview_role,
-        interview_plan,
-    )
+    try:
+        scoring = _build_interview_scoring_rubric(
+            transcript_text,
+            transcript_turns,
+            duration_seconds,
+            total_questions,
+            resume_score,
+            interview_role,
+            interview_plan,
+        )
+    except Exception as exc:
+        raise _to_scoring_provider_http_exception(exc) from exc
 
     updated_payload = {
         **score_payload,
@@ -2903,10 +3170,43 @@ def admin_bulk_update_candidate_stage(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="At least one candidate id is required")
 
     unique_candidate_ids = list(dict.fromkeys(candidate_ids))
+
+    if payload.runInBackground:
+        _record_admin_audit_log(
+            user,
+            "candidate_stage_bulk_update_queued",
+            "candidate",
+            None,
+            {"candidateCount": len(unique_candidate_ids), "stage": payload.stage},
+        )
+        job = _submit_background_job(
+            "candidate_bulk_stage_update",
+            lambda job_id: _admin_bulk_update_candidate_stage_job(
+                payload.stage,
+                unique_candidate_ids,
+                user,
+                job_id=job_id,
+            ),
+            candidateCount=len(unique_candidate_ids),
+            stage=payload.stage,
+            requestedBy=user.get("id"),
+        )
+        return {"jobId": job["id"], "status": job["status"], "type": job["type"]}
+
+    return _admin_bulk_update_candidate_stage_job(payload.stage, unique_candidate_ids, user, job_id=None)
+
+
+def _admin_bulk_update_candidate_stage_job(
+    stage: str,
+    candidate_ids: list[str],
+    actor: dict[str, Any],
+    job_id: str | None,
+) -> dict[str, Any]:
     missing_candidate_ids: list[str] = []
     updated_candidates: list[dict[str, Any]] = []
 
-    for candidate_id in unique_candidate_ids:
+    total = len(candidate_ids)
+    for index, candidate_id in enumerate(candidate_ids, start=1):
         candidate_rows = _supabase_request(
             f"/rest/v1/candidates?id=eq.{quote(candidate_id)}&select=*",
             method="GET",
@@ -2916,25 +3216,52 @@ def admin_bulk_update_candidate_stage(
 
         if not candidate_rows:
             missing_candidate_ids.append(candidate_id)
-            continue
+        else:
+            existing_candidate = candidate_rows[0] if isinstance(candidate_rows, list) else candidate_rows
 
-        _supabase_request(
-            f"/rest/v1/candidates?id=eq.{quote(candidate_id)}",
-            method="PATCH",
-            body={"current_stage": payload.stage},
-            bearer_token=settings.supabase_service_role_key,
-            use_service_role=True,
-        )
-        updated_candidates.append(_admin_refetch_candidate_detail(candidate_id))
+            _supabase_request(
+                f"/rest/v1/candidates?id=eq.{quote(candidate_id)}",
+                method="PATCH",
+                body={"current_stage": stage},
+                bearer_token=settings.supabase_service_role_key,
+                use_service_role=True,
+            )
+
+            updated_candidates.append(_admin_refetch_candidate_detail(candidate_id))
+
+        if job_id:
+            _store_background_job(
+                job_id,
+                {
+                    "updatedAt": datetime.now(UTC).isoformat(),
+                    "progress": {
+                        "processed": index,
+                        "total": total,
+                        "percent": int((index / total) * 100) if total else 100,
+                    },
+                },
+            )
 
     if not updated_candidates and missing_candidate_ids:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No candidates were found to update")
+
+    _record_admin_audit_log(
+        actor,
+        "candidate_stage_bulk_updated",
+        "candidate",
+        None,
+        {
+            "candidateCount": len(updated_candidates),
+            "missingCount": len(missing_candidate_ids),
+            "stage": stage,
+        },
+    )
 
     return {
         "updatedCount": len(updated_candidates),
         "missingCandidateIds": missing_candidate_ids,
         "updatedCandidates": updated_candidates,
-        "stage": payload.stage,
+        "stage": stage,
     }
 
 
