@@ -8,6 +8,7 @@ backend/.env.*.local
 frontend/.env
 frontend/.env.local
 frontend/.env.*.local
+NEXT_TODO.md
 
 # Python caches and build artifacts
 backend/__pycache__/
