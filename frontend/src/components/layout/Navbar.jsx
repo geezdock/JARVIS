@@ -7,7 +7,7 @@ import { useAuth } from '../../contexts/AuthContext';
 import Button from '../ui/Button';
 
 export default function Navbar() {
-  const { user, role, logout, interviewLock } = useAuth();
+  const { user, role, logout, interviewLock, clearInterviewLock } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
 
@@ -26,6 +26,13 @@ export default function Navbar() {
     } catch (error) {
       toast.error(error.message || 'Unable to logout');
     }
+  };
+
+  const onBackToDashboard = () => {
+    if (interviewLocked) {
+      clearInterviewLock();
+    }
+    navigate(backPath);
   };
 
   const navLinkClass = ({ isActive }) =>
@@ -63,7 +70,7 @@ export default function Navbar() {
         {user ? (
           <>
             {isLiveInterviewLocked ? null : isCandidateInterviewRoute ? (
-              <Button variant="secondary" size="sm" onClick={() => navigate(backPath)} className="gap-1.5">
+              <Button variant="secondary" size="sm" onClick={onBackToDashboard} className="gap-1.5">
                 <ArrowLeft size={16} /> Back to Dashboard
               </Button>
             ) : interviewLocked ? (

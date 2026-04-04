@@ -498,7 +498,7 @@ export default function Interview() {
 
     try {
       setLoadingGroqQuestion(true);
-      const response = await api.post(`/candidate/interview-session/${sessionData.session.id}/groq-next-question`, {
+      const response = await api.post(`/candidate/interview-session/${sessionData.session.id}/next-question`, {
         transcriptTurns: transcriptTurnsRef.current,
         questionsAsked: questionsAskedRef.current,
       });
@@ -514,7 +514,7 @@ export default function Interview() {
 
       const questionText = normalizeTranscriptText(payload.question || '');
       if (!questionText) {
-        throw new Error('Groq interviewer returned an empty question');
+        throw new Error('Interviewer returned an empty question');
       }
 
       const questionNumber = Number.isInteger(payload.questionNumber)
@@ -523,10 +523,10 @@ export default function Interview() {
 
       setQuestionsAsked(questionNumber);
       setAwaitingCandidateReply(true);
-      appendRealtimeTurn('ai', questionText, `ai-groq-${questionNumber}`);
+      appendRealtimeTurn('ai', questionText, `ai-next-${questionNumber}`);
       speakText(questionText);
     } catch (error) {
-      toast.error(error?.message || 'Unable to get next Groq interview question');
+      toast.error(error?.message || 'Unable to get next interview question');
     } finally {
       setLoadingGroqQuestion(false);
     }
@@ -1112,6 +1112,8 @@ export default function Interview() {
   };
 
   const onEndInterview = useCallback(async (completionReason = 'manual_end') => {
+    const safeCompletionReason = typeof completionReason === 'string' ? completionReason : 'manual_end';
+
     if (!sessionData?.session?.id) {
       toast.error('Interview session context is missing');
       return;
@@ -1152,7 +1154,7 @@ export default function Interview() {
         videoUrl: null,
         scorePayload: {
           role: sessionData?.interviewRole,
-          completionReason,
+          completionReason: safeCompletionReason,
           questionsAsked,
           maxQuestions: maxRealtimeQuestions,
           transcriptTurns,
@@ -1163,7 +1165,7 @@ export default function Interview() {
       clearInterviewLock();
       await exitFullscreenSafely();
       toast.success(
-        completionReason === 'question_limit_reached'
+        safeCompletionReason === 'question_limit_reached'
           ? 'Interview completed after the planned number of questions'
           : 'Interview completed and submitted',
       );
@@ -1296,7 +1298,7 @@ export default function Interview() {
             AI output mode: {aiOutputMode === 'openai_stream' ? 'openai_stream (browser voice fallback active)' : 'browser_tts'}
           </p>
           {useGroqVoiceMode ? (
-            <p className="mt-1 text-xs text-emerald-700">Groq interviewer enabled with browser voice playback.</p>
+            <p className="mt-1 text-xs text-emerald-700">Coding interviewer enabled with browser voice playback.</p>
           ) : null}
           {aiOutputMode === 'openai_stream' ? (
             <p className="mt-1 text-xs text-indigo-700">
@@ -1315,7 +1317,7 @@ export default function Interview() {
                 {useGroqVoiceMode ? `Question ${questionsAsked || 1} of ${maxRealtimeQuestions}` : `Question ${activeQuestionIndex + 1} of ${questions.length}`}
               </p>
               <p className="mt-2 text-sm font-semibold text-slate-900">
-                {useGroqVoiceMode ? (transcriptTurns.filter((turn) => turn.speaker === 'ai').slice(-1)[0]?.text || 'Loading Groq question...') : activeQuestion}
+                {useGroqVoiceMode ? (transcriptTurns.filter((turn) => turn.speaker === 'ai').slice(-1)[0]?.text || 'Loading interview question...') : activeQuestion}
               </p>
               <textarea
                 className="mt-3 h-24 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900 outline-none focus:border-teal-500"
@@ -1348,7 +1350,7 @@ export default function Interview() {
           {(aiOutputMode === 'openai_stream' && realtimeStatus !== 'fallback') || useGroqVoiceMode ? (
             <div className="mt-4 rounded-xl border border-slate-200 bg-white p-4">
               <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-                {useGroqVoiceMode ? 'Groq interview progress' : 'Realtime interview progress'}
+                {useGroqVoiceMode ? 'Coding interview progress' : 'Realtime interview progress'}
               </p>
               <p className="mt-2 text-sm text-slate-900">
                 Questions asked: <span className="font-semibold">{questionsAsked}</span> / {maxRealtimeQuestions}
@@ -1357,7 +1359,7 @@ export default function Interview() {
                 {awaitingCandidateReply
                   ? 'AI is waiting for your response.'
                   : useGroqVoiceMode
-                    ? 'Click next to fetch the next Groq question.'
+                    ? 'Click next to fetch the next coding question.'
                     : 'AI will ask the next question automatically.'}
               </p>
             </div>
@@ -1396,7 +1398,7 @@ export default function Interview() {
               {aiOutputMode === 'openai_stream'
                 ? 'Force Next Follow-up'
                 : useGroqVoiceMode
-                  ? (loadingGroqQuestion ? 'Loading...' : 'Next Groq Question')
+                  ? (loadingGroqQuestion ? 'Loading...' : 'Next Coding Question')
                   : 'Next Question'}
             </Button>
             <Button onClick={onEndInterview} disabled={connecting || completing || terminating} className="gap-1.5">

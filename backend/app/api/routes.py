@@ -317,7 +317,182 @@ def _effective_interview_output_mode() -> str:
     return settings.interview_ai_output_mode
 
 
-def _generate_groq_dynamic_question(
+LEETCODE_QUESTION_BANK: list[dict[str, Any]] = [
+    {"id": 1, "title": "Two Sum", "difficulty": "Easy", "url": "https://leetcode.com/problems/two-sum/", "tags": ["arrays", "hashmap"], "role_focus": ["backend", "frontend", "data", "general"], "prompt": "Describe your approach, complexity, and how you would test edge cases."},
+    {"id": 15, "title": "3Sum", "difficulty": "Medium", "url": "https://leetcode.com/problems/3sum/", "tags": ["arrays", "two-pointers", "sorting"], "role_focus": ["backend", "data", "general"], "prompt": "Explain how sorting + two pointers avoids duplicate triplets."},
+    {"id": 20, "title": "Valid Parentheses", "difficulty": "Easy", "url": "https://leetcode.com/problems/valid-parentheses/", "tags": ["stack", "strings"], "role_focus": ["frontend", "backend", "qa", "general"], "prompt": "Walk through stack state transitions for valid and invalid inputs."},
+    {"id": 53, "title": "Maximum Subarray", "difficulty": "Medium", "url": "https://leetcode.com/problems/maximum-subarray/", "tags": ["arrays", "dp"], "role_focus": ["backend", "data", "ml", "general"], "prompt": "Explain Kadane's algorithm and why it is optimal."},
+    {"id": 70, "title": "Climbing Stairs", "difficulty": "Easy", "url": "https://leetcode.com/problems/climbing-stairs/", "tags": ["dp"], "role_focus": ["backend", "ml", "general"], "prompt": "Derive the recurrence and discuss space optimization."},
+    {"id": 121, "title": "Best Time to Buy and Sell Stock", "difficulty": "Easy", "url": "https://leetcode.com/problems/best-time-to-buy-and-sell-stock/", "tags": ["arrays", "greedy"], "role_focus": ["backend", "data", "general"], "prompt": "Explain single-pass logic and how to justify correctness."},
+    {"id": 141, "title": "Linked List Cycle", "difficulty": "Easy", "url": "https://leetcode.com/problems/linked-list-cycle/", "tags": ["linked-list", "two-pointers"], "role_focus": ["backend", "general"], "prompt": "Explain Floyd cycle detection with an example."},
+    {"id": 146, "title": "LRU Cache", "difficulty": "Medium", "url": "https://leetcode.com/problems/lru-cache/", "tags": ["design", "hashmap", "linked-list"], "role_focus": ["backend", "ml", "general"], "prompt": "Describe O(1) get/put design and key implementation pitfalls."},
+    {"id": 155, "title": "Min Stack", "difficulty": "Medium", "url": "https://leetcode.com/problems/min-stack/", "tags": ["stack", "design"], "role_focus": ["frontend", "backend", "qa", "general"], "prompt": "Explain how you keep min retrieval O(1)."},
+    {"id": 200, "title": "Number of Islands", "difficulty": "Medium", "url": "https://leetcode.com/problems/number-of-islands/", "tags": ["graph", "dfs", "bfs"], "role_focus": ["backend", "data", "ml", "general"], "prompt": "Discuss DFS/BFS trade-offs and complexity."},
+    {"id": 206, "title": "Reverse Linked List", "difficulty": "Easy", "url": "https://leetcode.com/problems/reverse-linked-list/", "tags": ["linked-list"], "role_focus": ["backend", "general"], "prompt": "Compare iterative and recursive solutions."},
+    {"id": 215, "title": "Kth Largest Element in an Array", "difficulty": "Medium", "url": "https://leetcode.com/problems/kth-largest-element-in-an-array/", "tags": ["heap", "quickselect"], "role_focus": ["backend", "data", "ml", "general"], "prompt": "Explain heap vs quickselect trade-offs."},
+    {"id": 238, "title": "Product of Array Except Self", "difficulty": "Medium", "url": "https://leetcode.com/problems/product-of-array-except-self/", "tags": ["arrays", "prefix-suffix"], "role_focus": ["backend", "data", "general"], "prompt": "Explain how to avoid division and keep O(1) extra space."},
+    {"id": 300, "title": "Longest Increasing Subsequence", "difficulty": "Medium", "url": "https://leetcode.com/problems/longest-increasing-subsequence/", "tags": ["dp", "binary-search"], "role_focus": ["backend", "data", "ml", "general"], "prompt": "Explain O(n^2) DP and O(n log n) optimization."},
+    {"id": 347, "title": "Top K Frequent Elements", "difficulty": "Medium", "url": "https://leetcode.com/problems/top-k-frequent-elements/", "tags": ["hashmap", "heap", "bucket-sort"], "role_focus": ["backend", "data", "ml", "general"], "prompt": "Describe multiple approaches and when each is preferable."},
+    {"id": 417, "title": "Pacific Atlantic Water Flow", "difficulty": "Medium", "url": "https://leetcode.com/problems/pacific-atlantic-water-flow/", "tags": ["graph", "dfs", "bfs"], "role_focus": ["backend", "ml", "general"], "prompt": "Explain reverse-flow DFS/BFS intuition."},
+    {"id": 560, "title": "Subarray Sum Equals K", "difficulty": "Medium", "url": "https://leetcode.com/problems/subarray-sum-equals-k/", "tags": ["arrays", "prefix-sum", "hashmap"], "role_focus": ["backend", "data", "general"], "prompt": "Explain prefix sum hashmap logic with duplicate sums."},
+    {"id": 704, "title": "Binary Search", "difficulty": "Easy", "url": "https://leetcode.com/problems/binary-search/", "tags": ["binary-search"], "role_focus": ["backend", "frontend", "qa", "general"], "prompt": "Discuss loop invariants and off-by-one pitfalls."},
+    {"id": 733, "title": "Flood Fill", "difficulty": "Easy", "url": "https://leetcode.com/problems/flood-fill/", "tags": ["graph", "dfs", "bfs"], "role_focus": ["frontend", "backend", "qa", "general"], "prompt": "Explain recursion vs iterative queue implementation."},
+    {"id": 994, "title": "Rotting Oranges", "difficulty": "Medium", "url": "https://leetcode.com/problems/rotting-oranges/", "tags": ["graph", "bfs", "matrix"], "role_focus": ["backend", "data", "general"], "prompt": "Explain multi-source BFS and minute-level progression."},
+    {"id": 1143, "title": "Longest Common Subsequence", "difficulty": "Medium", "url": "https://leetcode.com/problems/longest-common-subsequence/", "tags": ["dp", "strings"], "role_focus": ["backend", "ml", "general"], "prompt": "Build the DP table and explain transitions."},
+    {"id": 125, "title": "Valid Palindrome", "difficulty": "Easy", "url": "https://leetcode.com/problems/valid-palindrome/", "tags": ["strings", "two-pointers"], "role_focus": ["frontend", "backend", "qa", "general"], "prompt": "Explain normalization and two-pointer traversal."},
+    {"id": 240, "title": "Search a 2D Matrix II", "difficulty": "Medium", "url": "https://leetcode.com/problems/search-a-2d-matrix-ii/", "tags": ["matrix", "binary-search"], "role_focus": ["backend", "data", "general"], "prompt": "Explain top-right elimination strategy."},
+]
+
+
+def _role_focus_bucket(interview_role: str) -> str:
+    normalized = (interview_role or "").strip().lower()
+    if "frontend" in normalized:
+        return "frontend"
+    if "backend" in normalized:
+        return "backend"
+    if "data" in normalized or "analyst" in normalized:
+        return "data"
+    if "machine learning" in normalized or normalized.startswith("ml"):
+        return "ml"
+    if "qa" in normalized or "test" in normalized:
+        return "qa"
+    if "product" in normalized:
+        return "pm"
+    return "general"
+
+
+def _extract_keywords(text: str) -> set[str]:
+    words = set(re.findall(r"[a-z0-9_+#.-]+", (text or "").lower()))
+    stopwords = {
+        "the", "and", "for", "with", "that", "this", "from", "into", "your", "you", "have", "has", "are", "was", "were", "will", "about", "role", "candidate", "experience", "work", "using", "used", "over", "under", "than", "where", "what", "when", "how", "why", "their", "them", "then", "also", "while", "into", "onto", "across", "more", "most", "very",
+    }
+    return {token for token in words if len(token) > 2 and token not in stopwords}
+
+
+def _derive_context_tags(keyword_set: set[str]) -> set[str]:
+    tag_rules = {
+        "python": {"hashmap", "arrays", "dp"},
+        "javascript": {"strings", "arrays", "stack"},
+        "typescript": {"strings", "arrays", "stack"},
+        "react": {"strings", "stack", "arrays"},
+        "node": {"hashmap", "graph"},
+        "sql": {"prefix-sum", "hashmap", "arrays"},
+        "postgres": {"prefix-sum", "hashmap"},
+        "api": {"hashmap", "design"},
+        "microservices": {"design", "graph"},
+        "redis": {"design", "hashmap"},
+        "cache": {"design", "linked-list", "hashmap"},
+        "search": {"binary-search", "arrays"},
+        "analytics": {"prefix-sum", "heap", "arrays"},
+        "etl": {"arrays", "hashmap", "heap"},
+        "data": {"arrays", "heap", "graph"},
+        "ml": {"dp", "heap", "graph"},
+        "machine": {"dp", "heap", "graph"},
+        "graph": {"graph", "dfs", "bfs"},
+        "tree": {"dfs", "bfs"},
+        "dynamic": {"dp"},
+        "testing": {"stack", "arrays", "strings"},
+        "quality": {"stack", "arrays", "strings"},
+    }
+
+    tags: set[str] = set()
+    for keyword in keyword_set:
+        tags.update(tag_rules.get(keyword, set()))
+    return tags
+
+
+def _already_asked_leetcode_ids(transcript_turns: list[dict[str, Any]]) -> set[int]:
+    transcript_blob = "\n".join(
+        str(turn.get("text") or "") for turn in transcript_turns if isinstance(turn, dict)
+    ).lower()
+    asked: set[int] = set()
+    for question in LEETCODE_QUESTION_BANK:
+        qid = question.get("id")
+        title = str(question.get("title") or "").lower()
+        prompt = str(question.get("prompt") or "").lower()
+        prompt_signature = prompt.split(".")[0].strip()
+        if not isinstance(qid, int):
+            continue
+        if (
+            f"leetcode {qid}" in transcript_blob
+            or (title and title in transcript_blob)
+            or (prompt_signature and prompt_signature in transcript_blob)
+        ):
+            asked.add(qid)
+    return asked
+
+
+def _infer_questions_asked_from_transcript(transcript_turns: list[dict[str, Any]]) -> int:
+    max_prefixed_ordinal = 0
+    ai_turn_count = 0
+
+    for turn in transcript_turns:
+        if not isinstance(turn, dict):
+            continue
+        speaker = str(turn.get("speaker") or "").strip().lower()
+        if speaker != "ai":
+            continue
+
+        text = str(turn.get("text") or "").strip()
+        if not text:
+            continue
+        ai_turn_count += 1
+
+        matched = re.match(r"^Q\s*(\d+)\s*/\s*\d+", text, flags=re.IGNORECASE)
+        if matched:
+            try:
+                max_prefixed_ordinal = max(max_prefixed_ordinal, int(matched.group(1)))
+            except ValueError:
+                pass
+
+    return max(max_prefixed_ordinal, ai_turn_count)
+
+
+def _already_asked_role_theory_indexes(transcript_turns: list[dict[str, Any]], role_questions: list[str]) -> set[int]:
+    transcript_blob = "\n".join(
+        str(turn.get("text") or "") for turn in transcript_turns if isinstance(turn, dict)
+    ).lower()
+    asked_indexes: set[int] = set()
+    for index, question in enumerate(role_questions):
+        signature = normalize = " ".join(question.lower().split())
+        if not signature:
+            continue
+        # Match by first clause to tolerate punctuation differences from client rendering.
+        first_clause = signature.split("?")[0].strip()
+        if first_clause and first_clause in transcript_blob:
+            asked_indexes.add(index)
+    return asked_indexes
+
+
+def _build_role_theory_questions(
+    interview_role: str,
+    interview_plan: dict[str, Any],
+    resume_summary: str,
+) -> list[str]:
+    job_context = interview_plan.get("job_context") if isinstance(interview_plan.get("job_context"), dict) else {}
+    flow_topics = interview_plan.get("flow") if isinstance(interview_plan.get("flow"), list) else []
+
+    job_title = str(job_context.get("title") or interview_role or "this role").strip()
+    required_skills = [str(skill).strip() for skill in (job_context.get("required_skills") or []) if str(skill).strip()]
+    responsibilities = [str(item).strip() for item in (job_context.get("key_responsibilities") or []) if str(item).strip()]
+    flow_topic_1 = str(flow_topics[0]).strip() if flow_topics else "problem solving"
+    flow_topic_2 = str(flow_topics[1]).strip() if len(flow_topics) > 1 else "execution"
+    skill_focus = required_skills[0] if required_skills else "core technical fundamentals"
+    skill_secondary = required_skills[1] if len(required_skills) > 1 else "system design"
+    responsibility_focus = responsibilities[0] if responsibilities else "delivering production-ready features"
+    resume_focus = (resume_summary or "").strip()
+    if len(resume_focus) > 180:
+        resume_focus = resume_focus[:177].rstrip() + "..."
+    resume_focus = resume_focus or "your recent project experience"
+
+    return [
+        f"For a {job_title} role, how would you plan and prioritize work around {responsibility_focus}, and what trade-offs would you make?",
+        f"Based on your resume mention of {resume_focus}, how would that experience help you handle {flow_topic_1} and {flow_topic_2} in this role?",
+        f"This job emphasizes {skill_focus} and {skill_secondary}; what practical approach would you follow to deliver impact in your first 90 days?",
+    ]
+
+
+def _generate_next_interview_question_from_leetcode(
     interview_role: str,
     interview_plan: dict[str, Any],
     resume_summary: str,
@@ -325,93 +500,94 @@ def _generate_groq_dynamic_question(
     next_question_number: int,
     max_questions: int,
 ) -> str:
-    groq_provider = get_llm_provider_by_name("groq")
-    if not groq_provider.is_configured():
-        raise SupabaseError("Interview question provider is not configured")
-
-    flow_topics = ", ".join(interview_plan.get("flow") or [])
-    seed_questions = " | ".join(interview_plan.get("questions") or [])
+    role_bucket = _role_focus_bucket(interview_role)
     job_context = interview_plan.get("job_context") if isinstance(interview_plan.get("job_context"), dict) else {}
-    required_skills = ", ".join(job_context.get("required_skills") or []) if isinstance(job_context, dict) else ""
 
-    transcript_lines: list[str] = []
-    for turn in transcript_turns[-14:]:
-        if not isinstance(turn, dict):
-            continue
-        speaker = str(turn.get("speaker") or "candidate")
-        text = str(turn.get("text") or "").strip()
-        if text:
-            transcript_lines.append(f"{speaker.upper()}: {text}")
-    transcript_excerpt = "\n".join(transcript_lines) if transcript_lines else "No transcript yet."
+    required_skills = job_context.get("required_skills") if isinstance(job_context.get("required_skills"), list) else []
+    nice_to_have_skills = job_context.get("nice_to_have_skills") if isinstance(job_context.get("nice_to_have_skills"), list) else []
+    key_responsibilities = job_context.get("key_responsibilities") if isinstance(job_context.get("key_responsibilities"), list) else []
+    job_title = str(job_context.get("title") or "")
 
-    prompt = (
-        f"Generate exactly one interview question for turn {next_question_number}/{max_questions}. "
-        "Return plain text only, no bullets, no preface. "
-        f"Prefix format required: Q{next_question_number}/{max_questions}: ... "
-        f"Role: {interview_role}. "
-        f"Resume summary: {resume_summary or 'Not provided'}. "
-        f"Flow topics: {flow_topics or 'General role fit'}. "
-        f"Seed question bank: {seed_questions or 'None'}. "
-        f"Required job skills: {required_skills or 'Not provided'}. "
-        "Avoid repeating prior topics already covered in transcript. "
-        f"Transcript:\n{transcript_excerpt}"
+    context_blob = " ".join(
+        [
+            interview_role,
+            resume_summary,
+            job_title,
+            " ".join(str(skill) for skill in required_skills),
+            " ".join(str(skill) for skill in nice_to_have_skills),
+            " ".join(str(resp) for resp in key_responsibilities),
+        ]
     )
+    context_keywords = _extract_keywords(context_blob)
+    context_tags = _derive_context_tags(context_keywords)
 
-    payload = {
-        "model": "llama-3.1-8b-instant",
-        "messages": [
-            {
-                "role": "system",
-                "content": "You are a concise technical interviewer. Ask one question only.",
-            },
-            {
-                "role": "user",
-                "content": prompt,
-            },
-        ],
-        "temperature": 0.7,
-        "max_tokens": 120,
-    }
+    coding_target = 3 if max_questions >= 6 else max(1, max_questions // 2)
+    role_target = 3 if max_questions >= 6 else max(0, max_questions - coding_target)
 
-    response: dict[str, Any] | None = None
-    last_error: Exception | None = None
-    max_attempts = 3
-    backoff_seconds = [0.5, 1.0, 2.0]
+    # Phase 1: coding theory questions (first 3 out of 6).
+    if next_question_number <= coding_target:
+        asked_ids = _already_asked_leetcode_ids(transcript_turns)
+        available_questions = [
+            question for question in LEETCODE_QUESTION_BANK
+            if isinstance(question.get("id"), int) and question.get("id") not in asked_ids
+        ]
+        if not available_questions:
+            available_questions = LEETCODE_QUESTION_BANK
 
-    for attempt in range(max_attempts):
-        try:
-            response = groq_provider.chat_completion(payload, timeout_seconds=30)
-            break
-        except LLMProviderError as exc:
-            last_error = exc
-            if exc.code in {"insufficient_quota", "invalid_api_key", "missing_key"}:
-                break
-            if attempt < max_attempts - 1 and exc.retryable:
-                time.sleep(backoff_seconds[attempt])
-                continue
-            break
-        except Exception as exc:
-            last_error = exc
-            if attempt < max_attempts - 1:
-                time.sleep(backoff_seconds[attempt])
-                continue
-            break
+        scored_questions: list[tuple[float, dict[str, Any]]] = []
+        for index, question in enumerate(available_questions):
+            score = 0.0
+            question_tags = set(question.get("tags") or [])
+            question_role_focus = set(question.get("role_focus") or [])
 
-    if response is None:
-        raise SupabaseError(
-            _friendly_interview_provider_error_message(str(last_error) if last_error else "Groq provider unavailable")
+            if role_bucket in question_role_focus:
+                score += 4.0
+            if "general" in question_role_focus:
+                score += 1.0
+
+            score += float(len(question_tags & context_tags)) * 2.0
+
+            question_text_blob = f"{question.get('title') or ''} {question.get('prompt') or ''}".lower()
+            keyword_overlap = len(_extract_keywords(question_text_blob) & context_keywords)
+            score += float(min(keyword_overlap, 4))
+
+            score -= index * 0.01
+            scored_questions.append((score, question))
+
+        scored_questions.sort(key=lambda item: item[0], reverse=True)
+        coding_position = max(0, next_question_number - 1)
+        if coding_position < len(scored_questions):
+            selected = scored_questions[coding_position][1]
+        else:
+            selected = scored_questions[0][1]
+        base_question = str(selected.get("prompt") or "Explain your approach, complexity, and edge cases.")
+    else:
+        # Phase 2: role/job-title theory questions (next 3 out of 6).
+        role_questions = _build_role_theory_questions(
+            interview_role=interview_role,
+            interview_plan=interview_plan,
+            resume_summary=resume_summary,
         )
+        asked_indexes = _already_asked_role_theory_indexes(transcript_turns, role_questions)
+        remaining_questions = [
+            question for index, question in enumerate(role_questions) if index not in asked_indexes
+        ]
+        if not remaining_questions:
+            remaining_questions = role_questions
 
-    content = (((response.get("choices") or [])[0] or {}).get("message") or {}).get("content")
-    question_text = str(content or "").strip()
-    if not question_text:
-        raise SupabaseError("Groq returned an empty interview question")
+        # Preserve deterministic ordering for a stable 3-question theory block.
+        role_position = next_question_number - coding_target - 1
+        if role_target > 0:
+            role_position = min(role_position, role_target - 1)
+        role_position = max(0, role_position)
+
+        if role_position < len(remaining_questions):
+            base_question = remaining_questions[role_position]
+        else:
+            base_question = remaining_questions[0]
 
     expected_prefix = f"Q{next_question_number}/{max_questions}:"
-    if not question_text.startswith(expected_prefix):
-        question_text = f"{expected_prefix} {question_text}"
-
-    return question_text
+    return f"{expected_prefix} {base_question}"
 
 
 def _supabase_request(
@@ -1913,7 +2089,15 @@ def candidate_interview_session_details(request_obj: Request, session_id: str) -
         use_service_role=True,
     )
     if not session_rows:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview session not found")
+        fallback_rows = _supabase_request(
+            f"/rest/v1/interview_sessions?candidate_id=eq.{quote(candidate['id'])}&status=eq.in_progress&select=*&order=created_at.desc&limit=1",
+            method="GET",
+            bearer_token=settings.supabase_service_role_key,
+            use_service_role=True,
+        )
+        if not fallback_rows:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview session not found")
+        session_rows = fallback_rows
 
     session_row = session_rows[0] if isinstance(session_rows, list) else session_rows
     interview_role, role_source = _resolve_interview_role(candidate)
@@ -1954,7 +2138,15 @@ def candidate_interview_session_realtime_token(request_obj: Request, session_id:
         use_service_role=True,
     )
     if not session_rows:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview session not found")
+        fallback_rows = _supabase_request(
+            f"/rest/v1/interview_sessions?candidate_id=eq.{quote(candidate['id'])}&status=eq.in_progress&select=*&order=created_at.desc&limit=1",
+            method="GET",
+            bearer_token=settings.supabase_service_role_key,
+            use_service_role=True,
+        )
+        if not fallback_rows:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview session not found")
+        session_rows = fallback_rows
 
     session_row = session_rows[0] if isinstance(session_rows, list) else session_rows
     session_status = (session_row.get("status") or "").strip().lower()
@@ -2041,18 +2233,13 @@ def candidate_interview_session_realtime_token(request_obj: Request, session_id:
     }
 
 
+@router.post("/candidate/interview-session/{session_id}/next-question")
 @router.post("/candidate/interview-session/{session_id}/groq-next-question")
-def candidate_interview_session_groq_next_question(
+def candidate_interview_session_next_question(
     request_obj: Request,
     session_id: str,
     payload: InterviewSessionNextQuestionPayload,
 ) -> dict[str, Any]:
-    if settings.interview_realtime_provider != "groq":
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Groq voice mode is not enabled for this deployment",
-        )
-
     if not _is_valid_uuid(session_id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -2070,7 +2257,15 @@ def candidate_interview_session_groq_next_question(
         use_service_role=True,
     )
     if not session_rows:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview session not found")
+        fallback_rows = _supabase_request(
+            f"/rest/v1/interview_sessions?candidate_id=eq.{quote(candidate['id'])}&status=eq.in_progress&select=*&order=created_at.desc&limit=1",
+            method="GET",
+            bearer_token=settings.supabase_service_role_key,
+            use_service_role=True,
+        )
+        if not fallback_rows:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview session not found")
+        session_rows = fallback_rows
 
     session_row = session_rows[0] if isinstance(session_rows, list) else session_rows
     session_status = (session_row.get("status") or "").strip().lower()
@@ -2099,7 +2294,13 @@ def candidate_interview_session_groq_next_question(
     if not isinstance(max_questions, int) or max_questions < 1:
         max_questions = max(1, settings.interview_max_questions)
 
-    questions_asked = payload.questionsAsked if isinstance(payload.questionsAsked, int) and payload.questionsAsked >= 0 else 0
+    transcript_turns = payload.transcriptTurns if isinstance(payload.transcriptTurns, list) else []
+
+    client_questions_asked = payload.questionsAsked if isinstance(payload.questionsAsked, int) and payload.questionsAsked >= 0 else 0
+    inferred_questions_asked = _infer_questions_asked_from_transcript(transcript_turns)
+    questions_asked = max(client_questions_asked, inferred_questions_asked)
+    if questions_asked > max_questions:
+        questions_asked = max_questions
     next_question_number = questions_asked + 1
     if next_question_number > max_questions:
         return {
@@ -2108,23 +2309,16 @@ def candidate_interview_session_groq_next_question(
             "maxQuestions": max_questions,
         }
 
-    transcript_turns = payload.transcriptTurns if isinstance(payload.transcriptTurns, list) else []
     resume_summary = candidate.get("ai_summary") or "Resume summary pending. Ask structured role-fit questions."
 
-    try:
-        question_text = _generate_groq_dynamic_question(
-            interview_role=interview_role,
-            interview_plan=interview_plan,
-            resume_summary=resume_summary,
-            transcript_turns=transcript_turns,
-            next_question_number=next_question_number,
-            max_questions=max_questions,
-        )
-    except SupabaseError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=_friendly_interview_provider_error_message(str(exc)),
-        ) from exc
+    question_text = _generate_next_interview_question_from_leetcode(
+        interview_role=interview_role,
+        interview_plan=interview_plan,
+        resume_summary=resume_summary,
+        transcript_turns=transcript_turns,
+        next_question_number=next_question_number,
+        max_questions=max_questions,
+    )
 
     return {
         "completed": False,

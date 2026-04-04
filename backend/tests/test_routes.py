@@ -326,23 +326,6 @@ def test_candidate_complete_endpoint_is_idempotent_for_completed_session(monkeyp
 
 
 def test_candidate_groq_next_question_returns_dynamic_prompt(monkeypatch):
-    class FakeGroqProvider:
-        def is_configured(self):
-            return True
-
-        def chat_completion(self, payload, timeout_seconds=60):
-            assert isinstance(payload, dict)
-            assert timeout_seconds == 30
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": "Q2/6: Describe a backend API trade-off you handled in production.",
-                        }
-                    }
-                ]
-            }
-
     def fake_get_supabase_user(_access_token):
         return {"id": "user-1", "email": "candidate@example.com"}
 
@@ -360,10 +343,10 @@ def test_candidate_groq_next_question_returns_dynamic_prompt(monkeypatch):
     monkeypatch.setattr(routes, "_get_or_create_candidate", fake_get_or_create_candidate)
     monkeypatch.setattr(routes, "_supabase_request", fake_supabase_request)
     monkeypatch.setattr(routes, "settings", replace(routes.settings, interview_realtime_provider="groq"))
-    monkeypatch.setattr(routes, "get_llm_provider_by_name", lambda provider_name: FakeGroqProvider() if provider_name == "groq" else FakeGroqProvider())
+    monkeypatch.setattr(routes, "get_llm_provider_by_name", lambda _provider_name: (_ for _ in ()).throw(AssertionError("LLM provider should not be called for LeetCode question selection")))
 
     response = client.post(
-        "/candidate/interview-session/11111111-1111-1111-1111-111111111111/groq-next-question",
+        "/candidate/interview-session/11111111-1111-1111-1111-111111111111/next-question",
         headers={"Authorization": "Bearer test-token"},
         json={"questionsAsked": 1, "transcriptTurns": []},
     )
@@ -374,16 +357,11 @@ def test_candidate_groq_next_question_returns_dynamic_prompt(monkeypatch):
     assert payload["questionNumber"] == 2
     assert payload["maxQuestions"] == 6
     assert payload["question"].startswith("Q2/6:")
+    assert "Coding question:" not in payload["question"]
+    assert "LeetCode" not in payload["question"]
 
 
-def test_candidate_groq_next_question_returns_503_for_auth_failure(monkeypatch):
-    class FakeGroqProvider:
-        def is_configured(self):
-            return True
-
-        def chat_completion(self, payload, timeout_seconds=60):
-            raise routes.LLMProviderError("Invalid API key", retryable=False, code="invalid_api_key")
-
+def test_candidate_groq_next_question_avoids_repeating_same_leetcode_problem(monkeypatch):
     def fake_get_supabase_user(_access_token):
         return {"id": "user-1", "email": "candidate@example.com"}
 
@@ -401,44 +379,34 @@ def test_candidate_groq_next_question_returns_503_for_auth_failure(monkeypatch):
     monkeypatch.setattr(routes, "_get_or_create_candidate", fake_get_or_create_candidate)
     monkeypatch.setattr(routes, "_supabase_request", fake_supabase_request)
     monkeypatch.setattr(routes, "settings", replace(routes.settings, interview_realtime_provider="groq"))
-    monkeypatch.setattr(routes, "get_llm_provider_by_name", lambda _provider_name: FakeGroqProvider())
 
     response = client.post(
-        "/candidate/interview-session/11111111-1111-1111-1111-111111111111/groq-next-question",
+        "/candidate/interview-session/11111111-1111-1111-1111-111111111111/next-question",
         headers={"Authorization": "Bearer test-token"},
-        json={"questionsAsked": 1, "transcriptTurns": []},
+        json={
+            "questionsAsked": 1,
+            "transcriptTurns": [
+                {
+                    "speaker": "ai",
+                    "text": "Q1/6: LeetCode 1 - Two Sum (Easy): Describe approach.",
+                }
+            ],
+        },
     )
 
-    assert response.status_code == 503
-    assert "authentication failed" in response.json()["detail"].lower()
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["questionNumber"] == 2
+    assert payload["question"].startswith("Q2/6:")
+    assert "Two Sum" not in payload["question"]
 
 
-def test_candidate_groq_next_question_retries_retryable_provider_error(monkeypatch):
-    call_count = {"value": 0}
-
-    class FakeGroqProvider:
-        def is_configured(self):
-            return True
-
-        def chat_completion(self, payload, timeout_seconds=60):
-            call_count["value"] += 1
-            if call_count["value"] < 2:
-                raise routes.LLMProviderError("Temporary upstream failure", retryable=True)
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": "Q2/6: Explain a trade-off you made while designing an API.",
-                        }
-                    }
-                ]
-            }
-
+def test_candidate_groq_next_question_prefers_backend_relevant_problem(monkeypatch):
     def fake_get_supabase_user(_access_token):
         return {"id": "user-1", "email": "candidate@example.com"}
 
     def fake_get_or_create_candidate(_user):
-        return {"id": "candidate-1", "ai_summary": "Strong Python and REST fundamentals."}
+        return {"id": "candidate-1", "ai_summary": "Strong Python, Redis caching, and API design fundamentals."}
 
     def fake_supabase_request(path, method="GET", body=None, bearer_token=None, use_service_role=False):
         if path.startswith("/rest/v1/interview_sessions?") and method == "GET":
@@ -451,16 +419,174 @@ def test_candidate_groq_next_question_retries_retryable_provider_error(monkeypat
     monkeypatch.setattr(routes, "_get_or_create_candidate", fake_get_or_create_candidate)
     monkeypatch.setattr(routes, "_supabase_request", fake_supabase_request)
     monkeypatch.setattr(routes, "settings", replace(routes.settings, interview_realtime_provider="groq"))
-    monkeypatch.setattr(routes, "get_llm_provider_by_name", lambda _provider_name: FakeGroqProvider())
 
     response = client.post(
-        "/candidate/interview-session/11111111-1111-1111-1111-111111111111/groq-next-question",
+        "/candidate/interview-session/11111111-1111-1111-1111-111111111111/next-question",
         headers={"Authorization": "Bearer test-token"},
         json={"questionsAsked": 1, "transcriptTurns": []},
     )
 
     assert response.status_code == 200
-    assert call_count["value"] == 2
+    assert response.json()["question"].startswith("Q2/6:")
+
+
+def test_candidate_next_question_switches_to_role_theory_after_three_questions(monkeypatch):
+    def fake_get_supabase_user(_access_token):
+        return {"id": "user-1", "email": "candidate@example.com"}
+
+    def fake_get_or_create_candidate(_user):
+        return {"id": "candidate-1", "ai_summary": "Built backend APIs for analytics workflows."}
+
+    def fake_supabase_request(path, method="GET", body=None, bearer_token=None, use_service_role=False):
+        if path.startswith("/rest/v1/interview_sessions?") and method == "GET":
+            return [{"id": "11111111-1111-1111-1111-111111111111", "status": "in_progress", "interview_role": "Backend Developer"}]
+        if path.startswith("/rest/v1/job_specifications?") and method == "GET":
+            return [
+                {
+                    "parsed_data": {
+                        "job_title": "Senior Backend Engineer",
+                        "required_skills": ["Python", "System Design"],
+                        "key_responsibilities": ["design scalable APIs"],
+                    }
+                }
+            ]
+        raise AssertionError(f"Unexpected request: {path}")
+
+    monkeypatch.setattr(routes, "_get_supabase_user", fake_get_supabase_user)
+    monkeypatch.setattr(routes, "_get_or_create_candidate", fake_get_or_create_candidate)
+    monkeypatch.setattr(routes, "_supabase_request", fake_supabase_request)
+    monkeypatch.setattr(routes, "settings", replace(routes.settings, interview_realtime_provider="groq"))
+
+    response = client.post(
+        "/candidate/interview-session/11111111-1111-1111-1111-111111111111/next-question",
+        headers={"Authorization": "Bearer test-token"},
+        json={"questionsAsked": 3, "transcriptTurns": []},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["questionNumber"] == 4
+    assert payload["question"].startswith("Q4/6:")
+    assert "Senior Backend Engineer" in payload["question"]
+
+
+def test_candidate_next_question_first_three_coding_questions_are_distinct(monkeypatch):
+    def fake_get_supabase_user(_access_token):
+        return {"id": "user-1", "email": "candidate@example.com"}
+
+    def fake_get_or_create_candidate(_user):
+        return {"id": "candidate-1", "ai_summary": "Backend API and distributed systems experience."}
+
+    def fake_supabase_request(path, method="GET", body=None, bearer_token=None, use_service_role=False):
+        if path.startswith("/rest/v1/interview_sessions?") and method == "GET":
+            return [{"id": "11111111-1111-1111-1111-111111111111", "status": "in_progress", "interview_role": "Backend Developer"}]
+        if path.startswith("/rest/v1/job_specifications?") and method == "GET":
+            return []
+        raise AssertionError(f"Unexpected request: {path}")
+
+    monkeypatch.setattr(routes, "_get_supabase_user", fake_get_supabase_user)
+    monkeypatch.setattr(routes, "_get_or_create_candidate", fake_get_or_create_candidate)
+    monkeypatch.setattr(routes, "_supabase_request", fake_supabase_request)
+    monkeypatch.setattr(routes, "settings", replace(routes.settings, interview_realtime_provider="groq"))
+
+    q1 = client.post(
+        "/candidate/interview-session/11111111-1111-1111-1111-111111111111/next-question",
+        headers={"Authorization": "Bearer test-token"},
+        json={"questionsAsked": 0, "transcriptTurns": []},
+    )
+    q2 = client.post(
+        "/candidate/interview-session/11111111-1111-1111-1111-111111111111/next-question",
+        headers={"Authorization": "Bearer test-token"},
+        json={"questionsAsked": 1, "transcriptTurns": []},
+    )
+    q3 = client.post(
+        "/candidate/interview-session/11111111-1111-1111-1111-111111111111/next-question",
+        headers={"Authorization": "Bearer test-token"},
+        json={"questionsAsked": 2, "transcriptTurns": []},
+    )
+
+    assert q1.status_code == 200
+    assert q2.status_code == 200
+    assert q3.status_code == 200
+
+    q1_text = q1.json()["question"]
+    q2_text = q2.json()["question"]
+    q3_text = q3.json()["question"]
+
+    assert q1_text != q2_text
+    assert q2_text != q3_text
+    assert q1_text != q3_text
+
+
+def test_candidate_next_question_uses_transcript_when_client_counter_is_stale(monkeypatch):
+    def fake_get_supabase_user(_access_token):
+        return {"id": "user-1", "email": "candidate@example.com"}
+
+    def fake_get_or_create_candidate(_user):
+        return {"id": "candidate-1", "ai_summary": "Backend API and distributed systems experience."}
+
+    def fake_supabase_request(path, method="GET", body=None, bearer_token=None, use_service_role=False):
+        if path.startswith("/rest/v1/interview_sessions?") and method == "GET":
+            return [{"id": "11111111-1111-1111-1111-111111111111", "status": "in_progress", "interview_role": "Backend Developer"}]
+        if path.startswith("/rest/v1/job_specifications?") and method == "GET":
+            return []
+        raise AssertionError(f"Unexpected request: {path}")
+
+    monkeypatch.setattr(routes, "_get_supabase_user", fake_get_supabase_user)
+    monkeypatch.setattr(routes, "_get_or_create_candidate", fake_get_or_create_candidate)
+    monkeypatch.setattr(routes, "_supabase_request", fake_supabase_request)
+    monkeypatch.setattr(routes, "settings", replace(routes.settings, interview_realtime_provider="groq"))
+
+    response = client.post(
+        "/candidate/interview-session/11111111-1111-1111-1111-111111111111/next-question",
+        headers={"Authorization": "Bearer test-token"},
+        json={
+            "questionsAsked": 0,
+            "transcriptTurns": [
+                {"speaker": "ai", "text": "Q1/6: Explain your approach and complexity trade-offs."}
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["questionNumber"] == 2
+
+
+def test_candidate_next_question_falls_back_to_latest_in_progress_session(monkeypatch):
+    def fake_get_supabase_user(_access_token):
+        return {"id": "user-1", "email": "candidate@example.com"}
+
+    def fake_get_or_create_candidate(_user):
+        return {"id": "candidate-1", "ai_summary": "Strong Python and API design."}
+
+    def fake_supabase_request(path, method="GET", body=None, bearer_token=None, use_service_role=False):
+        if path.startswith("/rest/v1/interview_sessions?id=eq.") and method == "GET":
+            return []
+        if (
+            path.startswith("/rest/v1/interview_sessions?")
+            and "candidate_id=eq.candidate-1" in path
+            and "status=eq.in_progress" in path
+            and method == "GET"
+        ):
+            return [{"id": "fallback-session", "status": "in_progress", "interview_role": "Backend Developer"}]
+        if path.startswith("/rest/v1/job_specifications?") and method == "GET":
+            return []
+        raise AssertionError(f"Unexpected request: {path}")
+
+    monkeypatch.setattr(routes, "_get_supabase_user", fake_get_supabase_user)
+    monkeypatch.setattr(routes, "_get_or_create_candidate", fake_get_or_create_candidate)
+    monkeypatch.setattr(routes, "_supabase_request", fake_supabase_request)
+    monkeypatch.setattr(routes, "settings", replace(routes.settings, interview_realtime_provider="groq"))
+
+    response = client.post(
+        "/candidate/interview-session/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/next-question",
+        headers={"Authorization": "Bearer test-token"},
+        json={"questionsAsked": 0, "transcriptTurns": []},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["questionNumber"] == 1
+    assert response.json()["question"].startswith("Q1/6:")
 
 
 def test_get_supabase_user_returns_503_on_supabase_network_error(monkeypatch):
