@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
 import { hasSupabaseConfig, supabase, supabaseConfigError } from '../lib/supabase';
 
 const AuthContext = createContext({});
@@ -66,15 +66,15 @@ export const AuthProvider = ({ children }) => {
     }
   });
 
-  const persistInterviewLock = (value) => {
+  const persistInterviewLock = useCallback((value) => {
     if (!value || !value.active) {
       window.sessionStorage.removeItem(INTERVIEW_LOCK_STORAGE_KEY);
       return;
     }
     window.sessionStorage.setItem(INTERVIEW_LOCK_STORAGE_KEY, JSON.stringify(value));
-  };
+  }, []);
 
-  const startInterviewLock = (sessionId) => {
+  const startInterviewLock = useCallback((sessionId) => {
     const lock = {
       active: true,
       sessionId: String(sessionId),
@@ -82,12 +82,12 @@ export const AuthProvider = ({ children }) => {
     };
     setInterviewLock(lock);
     persistInterviewLock(lock);
-  };
+  }, [persistInterviewLock]);
 
-  const clearInterviewLock = () => {
+  const clearInterviewLock = useCallback(() => {
     setInterviewLock(null);
     persistInterviewLock(null);
-  };
+  }, [persistInterviewLock]);
 
   useEffect(() => {
     const initializeAuth = async () => {

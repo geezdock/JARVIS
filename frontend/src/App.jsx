@@ -1,4 +1,4 @@
-import { Suspense, lazy } from 'react';
+import React, { Suspense, lazy } from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { Toaster } from 'react-hot-toast';
@@ -53,7 +53,10 @@ const InterviewLockGuard = ({ children }) => {
   const { interviewLock } = useAuth();
   const location = useLocation();
 
-  if (interviewLock?.active && location.pathname !== '/interview/live') {
+  const isInterviewRoute = location.pathname === '/interview' || location.pathname === '/interview/live';
+
+  // Only force redirect when user is leaving interview flow while a lock is active.
+  if (interviewLock?.active && !isInterviewRoute) {
     return <Navigate to="/interview/live" replace />;
   }
 
@@ -69,21 +72,54 @@ const NotFound = () => (
   </div>
 );
 
+class RouteErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, message: '' };
+  }
+
+  static getDerivedStateFromError(error) {
+    return {
+      hasError: true,
+      message: error?.message || 'Unknown runtime error',
+    };
+  }
+
+  componentDidCatch(error) {
+    console.error('Route render error:', error);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="mx-auto w-full max-w-3xl rounded-xl border border-rose-200 bg-rose-50 p-6 text-rose-900">
+          <h2 className="text-xl font-black">Page crashed while rendering</h2>
+          <p className="mt-2 text-sm">The page failed to render correctly. Refresh the page and try again.</p>
+          <p className="mt-3 rounded bg-white/70 p-3 text-xs">Error: {this.state.message}</p>
+        </div>
+      );
+    }
+
+    return this.props.children;
+  }
+}
+
 function MainRoutes() {
   return (
     <Router>
-      <InterviewLockGuard>
-        <div className="flex min-h-screen w-full flex-col bg-slate-50">
-          <Navbar />
-          <main className="mx-auto flex w-full max-w-7xl flex-1 flex-col px-4 pb-10 pt-6 sm:px-6 lg:px-8">
-            <Suspense
-              fallback={
-                <div className="flex min-h-[50vh] items-center justify-center text-slate-500">
-                  Loading page...
-                </div>
-              }
-            >
-              <Routes>
+      <RouteErrorBoundary>
+        <InterviewLockGuard>
+          <div className="flex min-h-screen w-full flex-col bg-slate-50">
+            <Navbar />
+            <main className="mx-auto flex w-full max-w-7xl flex-1 flex-col px-4 pb-10 pt-6 sm:px-6 lg:px-8">
+              <Suspense
+                fallback={
+                  <div className="flex min-h-[50vh] items-center justify-center text-slate-500">
+                    Loading page...
+                  </div>
+                }
+              >
+                <Routes>
                 <Route path="/" element={<Landing />} />
                 <Route path="/login" element={<Login />} />
                 <Route path="/signup" element={<Signup />} />
@@ -149,21 +185,22 @@ function MainRoutes() {
                 />
 
                 <Route path="*" element={<NotFound />} />
-              </Routes>
-            </Suspense>
-          </main>
-          <Toaster
-            position="bottom-right"
-            toastOptions={{
-              style: {
-                borderRadius: '12px',
-                background: '#0f172a',
-                color: '#f8fafc',
-              },
-            }}
-          />
-        </div>
-      </InterviewLockGuard>
+                </Routes>
+              </Suspense>
+            </main>
+            <Toaster
+              position="bottom-right"
+              toastOptions={{
+                style: {
+                  borderRadius: '12px',
+                  background: '#0f172a',
+                  color: '#f8fafc',
+                },
+              }}
+            />
+          </div>
+        </InterviewLockGuard>
+      </RouteErrorBoundary>
     </Router>
   );
 }

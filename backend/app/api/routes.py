@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from pypdf import PdfReader
 
 from app.config import settings
+from app.llm.providers import LLMProviderError, get_llm_provider, get_llm_provider_by_name, get_llm_provider_chain
 
 router = APIRouter()
 
@@ -103,6 +104,11 @@ class InterviewSessionTerminatePayload(BaseModel):
     durationSeconds: int | None = None
 
 
+class InterviewSessionNextQuestionPayload(BaseModel):
+    transcriptTurns: list[dict[str, Any]] | None = None
+    questionsAsked: int = 0
+
+
 class AdminHiringOutcomePayload(BaseModel):
     outcome: str
     retentionDays: int = 30
@@ -115,6 +121,24 @@ class AdminCleanupArtifactsPayload(BaseModel):
 
 class SupabaseError(RuntimeError):
     pass
+
+
+def _is_supabase_network_error(raw_message: str | None) -> bool:
+    normalized = (raw_message or "").lower()
+    return any(
+        token in normalized
+        for token in [
+            "supabase_network_error",
+            "timed out",
+            "timeout",
+            "forcibly closed",
+            "connection reset",
+            "temporary failure",
+            "name or service not known",
+            "network is unreachable",
+            "ssl",
+        ]
+    )
 
 
 INTERVIEW_ROLES = [
@@ -258,6 +282,17 @@ def _build_role_specific_interview_plan(interview_role: str, job_spec: dict[str,
         "role": interview_role,
         "flow": plan["flow"],
         "questions": plan["questions"],
+        "realtime": {
+            "strategy": "dynamic_turn_based",
+            "voiceProvider": "groq_browser" if settings.interview_realtime_provider == "groq" else "openai_realtime",
+            "maxQuestions": max(1, settings.interview_max_questions),
+            "maxDurationSeconds": max(300, settings.interview_max_duration_seconds),
+            "instructions": {
+                "questionPolicy": "Ask one concise question at a time and avoid repeats.",
+                "grounding": "Use role context, resume summary, and job specification context when available.",
+                "completionSignal": "After maxQuestions, conclude with INTERVIEW_COMPLETE.",
+            },
+        },
     }
 
     # Enhance plan with job specification if available
@@ -274,6 +309,109 @@ def _build_role_specific_interview_plan(interview_role: str, job_spec: dict[str,
         # For now, we include the job context for the interviewer reference
     
     return base_plan
+
+
+def _effective_interview_output_mode() -> str:
+    if settings.interview_realtime_provider == "groq":
+        return "browser_tts"
+    return settings.interview_ai_output_mode
+
+
+def _generate_groq_dynamic_question(
+    interview_role: str,
+    interview_plan: dict[str, Any],
+    resume_summary: str,
+    transcript_turns: list[dict[str, Any]],
+    next_question_number: int,
+    max_questions: int,
+) -> str:
+    groq_provider = get_llm_provider_by_name("groq")
+    if not groq_provider.is_configured():
+        raise SupabaseError("Interview question provider is not configured")
+
+    flow_topics = ", ".join(interview_plan.get("flow") or [])
+    seed_questions = " | ".join(interview_plan.get("questions") or [])
+    job_context = interview_plan.get("job_context") if isinstance(interview_plan.get("job_context"), dict) else {}
+    required_skills = ", ".join(job_context.get("required_skills") or []) if isinstance(job_context, dict) else ""
+
+    transcript_lines: list[str] = []
+    for turn in transcript_turns[-14:]:
+        if not isinstance(turn, dict):
+            continue
+        speaker = str(turn.get("speaker") or "candidate")
+        text = str(turn.get("text") or "").strip()
+        if text:
+            transcript_lines.append(f"{speaker.upper()}: {text}")
+    transcript_excerpt = "\n".join(transcript_lines) if transcript_lines else "No transcript yet."
+
+    prompt = (
+        f"Generate exactly one interview question for turn {next_question_number}/{max_questions}. "
+        "Return plain text only, no bullets, no preface. "
+        f"Prefix format required: Q{next_question_number}/{max_questions}: ... "
+        f"Role: {interview_role}. "
+        f"Resume summary: {resume_summary or 'Not provided'}. "
+        f"Flow topics: {flow_topics or 'General role fit'}. "
+        f"Seed question bank: {seed_questions or 'None'}. "
+        f"Required job skills: {required_skills or 'Not provided'}. "
+        "Avoid repeating prior topics already covered in transcript. "
+        f"Transcript:\n{transcript_excerpt}"
+    )
+
+    payload = {
+        "model": "llama-3.1-8b-instant",
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a concise technical interviewer. Ask one question only.",
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ],
+        "temperature": 0.7,
+        "max_tokens": 120,
+    }
+
+    response: dict[str, Any] | None = None
+    last_error: Exception | None = None
+    max_attempts = 3
+    backoff_seconds = [0.5, 1.0, 2.0]
+
+    for attempt in range(max_attempts):
+        try:
+            response = groq_provider.chat_completion(payload, timeout_seconds=30)
+            break
+        except LLMProviderError as exc:
+            last_error = exc
+            if exc.code in {"insufficient_quota", "invalid_api_key", "missing_key"}:
+                break
+            if attempt < max_attempts - 1 and exc.retryable:
+                time.sleep(backoff_seconds[attempt])
+                continue
+            break
+        except Exception as exc:
+            last_error = exc
+            if attempt < max_attempts - 1:
+                time.sleep(backoff_seconds[attempt])
+                continue
+            break
+
+    if response is None:
+        raise SupabaseError(
+            _friendly_interview_provider_error_message(str(last_error) if last_error else "Groq provider unavailable")
+        )
+
+    content = (((response.get("choices") or [])[0] or {}).get("message") or {}).get("content")
+    question_text = str(content or "").strip()
+    if not question_text:
+        raise SupabaseError("Groq returned an empty interview question")
+
+    expected_prefix = f"Q{next_question_number}/{max_questions}:"
+    if not question_text.startswith(expected_prefix):
+        question_text = f"{expected_prefix} {question_text}"
+
+    return question_text
 
 
 def _supabase_request(
@@ -316,6 +454,10 @@ def _supabase_request(
     except error.HTTPError as exc:
         raw_error = exc.read().decode("utf-8") if exc.fp else ""
         raise SupabaseError(raw_error or exc.reason) from exc
+    except error.URLError as exc:
+        raise SupabaseError(f"supabase_network_error: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise SupabaseError("supabase_network_error: request timed out") from exc
 
 
 def _get_bearer_token(request_obj: Request) -> str:
@@ -337,6 +479,11 @@ def _get_supabase_user(access_token: str) -> dict[str, Any]:
             bearer_token=access_token,
         )
     except SupabaseError as exc:
+        if _is_supabase_network_error(str(exc)):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Authentication service temporarily unavailable. Please try again shortly.",
+            ) from exc
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid Supabase access token",
@@ -666,57 +813,18 @@ def _create_openai_realtime_session(
     resume_summary: str,
     include_client_secret: bool = False,
 ) -> dict[str, Any] | None:
-    if not settings.openai_api_key:
+    provider = get_llm_provider_by_name(settings.interview_realtime_provider)
+    if not provider.is_configured():
         return None
-
-    instructions = (
-        "You are an AI interviewer. Conduct a formal interview with concise, professional language. "
-        f"Role: {interview_role}. "
-        f"Resume summary: {resume_summary}. "
-        "Ask one question at a time, wait for the candidate response, then ask follow-ups when needed. "
-        f"Preferred question sequence: {json.dumps(interview_plan.get('questions') or [], ensure_ascii=True)}"
-    )
-
-    payload = {
-        "model": "gpt-4o-realtime-preview-2024-12-17",
-        "voice": "alloy",
-        "modalities": ["audio", "text"],
-        "instructions": instructions,
-    }
-
-    req = request.Request(
-        "https://api.openai.com/v1/realtime/sessions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {settings.openai_api_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-        method="POST",
-    )
-
     try:
-        with request.urlopen(req, timeout=30) as response:
-            session_data = json.loads(response.read().decode("utf-8"))
+        return provider.create_realtime_session(
+            interview_role=interview_role,
+            interview_plan=interview_plan,
+            resume_summary=resume_summary,
+            include_client_secret=include_client_secret,
+        )
     except Exception:
         return None
-
-    if not isinstance(session_data, dict):
-        return None
-
-    payload: dict[str, Any] = {
-        "id": session_data.get("id"),
-        "model": session_data.get("model"),
-        "expires_at": session_data.get("expires_at"),
-    }
-
-    # Return ephemeral client secret only for the dedicated authenticated token endpoint.
-    if include_client_secret:
-        client_secret = session_data.get("client_secret")
-        if isinstance(client_secret, dict):
-            payload["client_secret"] = client_secret
-
-    return payload
 
 
 def _get_current_application_stage(candidate: dict[str, Any]) -> str:
@@ -797,7 +905,7 @@ def _friendly_scoring_error_message(raw_message: str | None) -> str:
 
     if "insufficient_quota" in normalized or "quota" in normalized or "billing" in normalized:
         return "Scoring provider quota exceeded. Please retry later or contact support."
-    if "openai_api_key is not configured" in normalized:
+    if "provider is not configured" in normalized or "missing_key" in normalized:
         return "Scoring provider is not configured. Please contact support."
     if "invalid api key" in normalized or "authentication" in normalized:
         return "Scoring provider authentication failed. Please contact support."
@@ -805,66 +913,67 @@ def _friendly_scoring_error_message(raw_message: str | None) -> str:
     return "Scoring provider unavailable. Please try again shortly."
 
 
+def _friendly_interview_provider_error_message(raw_message: str | None) -> str:
+    normalized = (raw_message or "").lower()
+
+    if "insufficient_quota" in normalized or "quota" in normalized or "billing" in normalized:
+        return "Interview question provider quota exceeded. Please retry later."
+    if "provider is not configured" in normalized or "missing_key" in normalized or "not configured" in normalized:
+        return "Interview question provider is not configured. Please contact support."
+    if (
+        "invalid api key" in normalized
+        or "incorrect api key" in normalized
+        or "invalid_api_key" in normalized
+        or "authentication" in normalized
+        or "unauthorized" in normalized
+    ):
+        return "Interview question provider authentication failed. Please contact support."
+
+    return "Interview question provider unavailable. Please try again shortly."
+
+
 def _openai_chat_completion_with_retry(payload: dict[str, Any], timeout_seconds: int = 60) -> dict[str, Any]:
-    if not settings.openai_api_key:
-        raise SupabaseError("OPENAI_API_KEY is not configured")
+    provider_chain = get_llm_provider_chain(settings.llm_provider, settings.llm_provider_fallbacks)
+    configured_chain = [provider for provider in provider_chain if provider.is_configured()]
+    if not configured_chain:
+        raise SupabaseError("No configured LLM provider found. Check LLM_PROVIDER and fallback keys.")
 
     max_attempts = 3
     backoff_seconds = [0.8, 1.6, 3.2]
+    last_error: Exception | None = None
 
-    for attempt in range(max_attempts):
-        req = request.Request(
-            "https://api.openai.com/v1/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {settings.openai_api_key}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-            method="POST",
-        )
+    for provider in configured_chain:
+        for attempt in range(max_attempts):
+            try:
+                return provider.chat_completion(payload, timeout_seconds=timeout_seconds)
+            except LLMProviderError as exc:
+                last_error = exc
+                # Quota/auth/config failures should trigger provider fallback quickly.
+                if exc.code in {"insufficient_quota", "invalid_api_key", "missing_key"}:
+                    break
+                if attempt < max_attempts - 1 and exc.retryable:
+                    time.sleep(backoff_seconds[attempt])
+                    continue
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt < max_attempts - 1:
+                    time.sleep(backoff_seconds[attempt])
+                    continue
+                break
 
-        try:
-            with request.urlopen(req, timeout=timeout_seconds) as response:
-                parsed = json.loads(response.read().decode("utf-8"))
-                if isinstance(parsed, dict):
-                    return parsed
-                raise SupabaseError("OpenAI returned unexpected payload")
-        except error.HTTPError as exc:
-            status_code = getattr(exc, "code", None)
-            raw_error = exc.read().decode("utf-8") if exc.fp else ""
-            retryable = status_code in {408, 409, 425, 429, 500, 502, 503, 504}
-            if attempt < max_attempts - 1 and retryable:
-                time.sleep(backoff_seconds[attempt])
-                continue
-            error_code, error_message = _extract_openai_error(raw_error)
-            if error_code == "insufficient_quota":
-                raise SupabaseError("Scoring provider quota exceeded. Please retry later.") from exc
-            raise SupabaseError(_friendly_scoring_error_message(error_message or raw_error or str(exc.reason))) from exc
-        except Exception as exc:
-            if attempt < max_attempts - 1:
-                time.sleep(backoff_seconds[attempt])
-                continue
-            raise SupabaseError(_friendly_scoring_error_message(str(exc))) from exc
-
-    raise SupabaseError("OpenAI request failed after retries")
+    if isinstance(last_error, LLMProviderError) and last_error.code == "insufficient_quota":
+        raise SupabaseError("Scoring provider quota exceeded. Please retry later.") from last_error
+    raise SupabaseError(_friendly_scoring_error_message(str(last_error) if last_error else "LLM providers unavailable"))
 
 
 def _ensure_openai_scoring_ready() -> None:
-    if not settings.openai_api_key:
-        raise SupabaseError("OPENAI_API_KEY is not configured")
+    provider_chain = get_llm_provider_chain(settings.llm_provider, settings.llm_provider_fallbacks)
+    if not any(provider.is_configured() for provider in provider_chain):
+        raise SupabaseError("No configured LLM provider found. Check LLM_PROVIDER and fallback keys.")
 
-    preflight_payload = {
-        "model": settings.openai_model,
-        "messages": [
-            {"role": "system", "content": "Return strict JSON only."},
-            {"role": "user", "content": '{"status":"ok"}'},
-        ],
-        "temperature": 0,
-        "response_format": {"type": "json_object"},
-        "max_tokens": 20,
-    }
-    _openai_chat_completion_with_retry(preflight_payload, timeout_seconds=30)
+    # Avoid blocking interview start on external LLM health checks.
+    # Actual scoring calls still run later and already have retry/error handling.
 
 
 def _to_scoring_provider_http_exception(exc: Exception) -> HTTPException:
@@ -880,12 +989,9 @@ def _openai_resume_analysis(
     extracted_text: str,
     interview_role: str,
 ) -> dict[str, Any]:
-    if not settings.openai_api_key:
-        raise SupabaseError("OPENAI_API_KEY is not configured")
-
     prompt = _build_resume_prompt(candidate, latest_upload, extracted_text, interview_role)
     payload = {
-        "model": settings.openai_model,
+        "model": settings.llm_model,
         "messages": [
             {"role": "system", "content": "You analyze resumes and respond with strict JSON only."},
             {"role": "user", "content": prompt},
@@ -898,7 +1004,7 @@ def _openai_resume_analysis(
 
     content = (((data.get("choices") or [])[0] or {}).get("message") or {}).get("content")
     if not isinstance(content, str) or not content.strip():
-        raise SupabaseError("OpenAI returned an empty analysis payload")
+        raise SupabaseError("LLM provider returned an empty analysis payload")
 
     parsed = json.loads(content)
     summary = str(parsed.get("summary") or "").strip()
@@ -952,9 +1058,6 @@ def _build_resume_analysis(candidate: dict[str, Any], latest_upload: dict[str, A
     resolved_interview_role, resolved_role_source = _resolve_interview_role(candidate, inferred_role)
     normalized_role = resolved_interview_role.lower()
 
-    if not settings.openai_api_key:
-        raise SupabaseError("OPENAI_API_KEY is not configured")
-
     analysis = _openai_resume_analysis(candidate, latest_upload, extracted_text, resolved_interview_role)
     analysis["ai_transcript"] = (
         f"Interview role source: {resolved_role_source}. "
@@ -965,13 +1068,43 @@ def _build_resume_analysis(candidate: dict[str, Any], latest_upload: dict[str, A
 
 
 def _persist_candidate_analysis(candidate_id: str, analysis: dict[str, Any]) -> None:
-    _supabase_request(
-        f"/rest/v1/candidates?id=eq.{quote(candidate_id)}",
-        method="PATCH",
-        body=analysis,
-        bearer_token=settings.supabase_service_role_key,
-        use_service_role=True,
-    )
+    payload = dict(analysis or {})
+
+    try:
+        _supabase_request(
+            f"/rest/v1/candidates?id=eq.{quote(candidate_id)}",
+            method="PATCH",
+            body=payload,
+            bearer_token=settings.supabase_service_role_key,
+            use_service_role=True,
+        )
+        return
+    except SupabaseError as exc:
+        # Backward-compatible fallback for deployments where newer optional columns
+        # (for example ai_experience_level) are not yet present in schema cache.
+        err_text = str(exc)
+        if "Could not find the '" not in err_text or "column of 'candidates'" not in err_text:
+            raise
+
+        missing_col_match = re.search(r"Could not find the '([^']+)' column", err_text)
+        if not missing_col_match:
+            raise
+
+        missing_col = missing_col_match.group(1)
+        if missing_col not in payload:
+            raise
+
+        payload.pop(missing_col, None)
+        if not payload:
+            return
+
+        _supabase_request(
+            f"/rest/v1/candidates?id=eq.{quote(candidate_id)}",
+            method="PATCH",
+            body=payload,
+            bearer_token=settings.supabase_service_role_key,
+            use_service_role=True,
+        )
 
 
 def _parse_job_specification(raw_text: str) -> dict[str, Any]:
@@ -979,9 +1112,6 @@ def _parse_job_specification(raw_text: str) -> dict[str, Any]:
     Parse raw job specification text into structured JSON using OpenAI.
     Returns a dict with required_skills, nice_to_have_skills, seniority, responsibilities, evaluation_rubric.
     """
-    if not settings.openai_api_key:
-        raise SupabaseError("OPENAI_API_KEY is not configured")
-    
     if not raw_text or not raw_text.strip():
         raise ValueError("Job specification text is empty")
     
@@ -1011,7 +1141,7 @@ Job Specification:
 {raw_text}"""
 
     payload = {
-        "model": settings.openai_model,
+        "model": settings.llm_model,
         "messages": [
             {"role": "system", "content": "You are a job specification analyzer. Extract structured data and respond with strict JSON only—no markdown, no additional text."},
             {"role": "user", "content": prompt},
@@ -1025,7 +1155,7 @@ Job Specification:
         content = (((data.get("choices") or [])[0] or {}).get("message") or {}).get("content")
         
         if not isinstance(content, str) or not content.strip():
-            raise SupabaseError("OpenAI returned empty job spec analysis")
+            raise SupabaseError("LLM provider returned empty job spec analysis")
         
         parsed = json.loads(content)
         return {
@@ -1118,12 +1248,9 @@ def _openai_interview_analysis(
     transcript_turns: list[dict[str, Any]] | None,
     duration_seconds: int | None,
 ) -> dict[str, Any]:
-    if not settings.openai_api_key:
-        raise SupabaseError("OPENAI_API_KEY is not configured")
-
     prompt = _build_interview_prompt(interview_role, interview_plan, question_answer_pairs, transcript_turns, duration_seconds)
     payload = {
-        "model": settings.openai_model,
+        "model": settings.llm_model,
         "messages": [
             {"role": "system", "content": "You evaluate interview responses and respond with strict JSON only."},
             {"role": "user", "content": prompt},
@@ -1136,7 +1263,7 @@ def _openai_interview_analysis(
 
     content = (((data.get("choices") or [])[0] or {}).get("message") or {}).get("content")
     if not isinstance(content, str) or not content.strip():
-        raise SupabaseError("OpenAI returned an empty interview analysis payload")
+        raise SupabaseError("LLM provider returned an empty interview analysis payload")
 
     parsed = json.loads(content)
     question_evaluations = parsed.get("question_evaluations") or []
@@ -1590,25 +1717,23 @@ def candidate_interview_session_start(
             detail="Consent is required before starting an interview session",
         )
 
-    try:
-        _ensure_openai_scoring_ready()
-    except SupabaseError as exc:
-        raise _to_scoring_provider_http_exception(exc) from exc
-
     access_token = _get_bearer_token(request_obj)
     user = _get_supabase_user(access_token)
     candidate = _get_or_create_candidate(user)
     application_stage = _get_current_application_stage(candidate)
 
     existing_sessions = _supabase_request(
-        f"/rest/v1/interview_sessions?candidate_id=eq.{quote(candidate['id'])}&application_stage=eq.{quote(application_stage)}&select=*",
+        f"/rest/v1/interview_sessions?candidate_id=eq.{quote(candidate['id'])}&application_stage=eq.{quote(application_stage)}&select=*&order=created_at.desc",
         method="GET",
         bearer_token=settings.supabase_service_role_key,
         use_service_role=True,
     )
     existing_session = existing_sessions[0] if isinstance(existing_sessions, list) and existing_sessions else None
+    retry_existing_session = None
     if existing_session:
-        if existing_session.get("status") == "in_progress":
+        existing_status = (existing_session.get("status") or "").strip().lower()
+
+        if existing_status == "in_progress":
             # Fetch job spec for existing in-progress session
             job_specs = _supabase_request(
                 f"/rest/v1/job_specifications?candidate_id=eq.{quote(candidate['id'])}&select=*&order=created_at.desc&limit=1",
@@ -1634,12 +1759,27 @@ def candidate_interview_session_start(
                 ),
                 "resumeSummary": candidate.get("ai_summary") or "Resume summary pending. Ask structured role-fit questions.",
                 "realtime": None,
+                "aiOutputMode": _effective_interview_output_mode(),
             }
 
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="An interview session already exists for this application stage",
-        )
+        # Allow retry for sessions that ended unsuccessfully.
+        if existing_status in {"failed", "terminated"}:
+            retry_existing_session = existing_session
+            existing_session = None
+
+        if existing_status in {"completed", "scored"}:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Interview already completed for this application stage",
+            )
+
+        if existing_session is None:
+            pass
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="An interview session already exists for this application stage",
+            )
 
     uploads = _supabase_request(
         f"/rest/v1/profile_uploads?candidate_id=eq.{quote(candidate['id'])}&select=*&order=created_at.desc&limit=1",
@@ -1688,28 +1828,46 @@ def candidate_interview_session_start(
     )
     slot = slot_rows[0] if isinstance(slot_rows, list) else slot_rows
 
-    session_rows = _supabase_request(
-        "/rest/v1/interview_sessions?select=*",
-        method="POST",
-        body={
-            "candidate_id": candidate["id"],
-            "application_stage": application_stage,
-            "slot_id": slot.get("id") if isinstance(slot, dict) else None,
-            "status": "in_progress",
-            "interview_role": interview_role,
-            "role_source": role_source,
-            "provider": "openai-realtime",
-            "started_at": started_at,
-            "consent_given": bool(payload.consentGiven),
-            "consent_at": started_at if payload.consentGiven else None,
-        },
-        bearer_token=settings.supabase_service_role_key,
-        use_service_role=True,
-    )
+    session_payload = {
+        "candidate_id": candidate["id"],
+        "application_stage": application_stage,
+        "slot_id": slot.get("id") if isinstance(slot, dict) else None,
+        "status": "in_progress",
+        "interview_role": interview_role,
+        "role_source": role_source,
+        "provider": settings.llm_provider,
+        "started_at": started_at,
+        "ended_at": None,
+        "consent_given": bool(payload.consentGiven),
+        "consent_at": started_at if payload.consentGiven else None,
+    }
+
+    if retry_existing_session and isinstance(retry_existing_session, dict) and retry_existing_session.get("id"):
+        session_rows = _supabase_request(
+            f"/rest/v1/interview_sessions?id=eq.{quote(retry_existing_session['id'])}&select=*",
+            method="PATCH",
+            body=session_payload,
+            bearer_token=settings.supabase_service_role_key,
+            use_service_role=True,
+        )
+    else:
+        session_rows = _supabase_request(
+            "/rest/v1/interview_sessions?select=*",
+            method="POST",
+            body=session_payload,
+            bearer_token=settings.supabase_service_role_key,
+            use_service_role=True,
+        )
+
     session = session_rows[0] if isinstance(session_rows, list) else session_rows
 
     resume_summary = candidate.get("ai_summary") or "Resume summary pending. Ask structured role-fit questions."
     realtime_response = _create_openai_realtime_session(interview_role, interview_plan, resume_summary)
+
+    scoring_provider_ready = any(
+        provider.is_configured()
+        for provider in get_llm_provider_chain(settings.llm_provider, settings.llm_provider_fallbacks)
+    )
 
     # Return only public fields; client_secret stays server-side
     realtime_public = None
@@ -1731,7 +1889,8 @@ def candidate_interview_session_start(
         "interviewPlan": interview_plan,
         "resumeSummary": resume_summary,
         "realtime": realtime_public,
-        "aiOutputMode": settings.interview_ai_output_mode,
+        "aiOutputMode": _effective_interview_output_mode(),
+        "scoringProviderReady": scoring_provider_ready,
     }
 
 
@@ -1772,27 +1931,21 @@ def candidate_interview_session_details(request_obj: Request, session_id: str) -
         "interviewRoleSource": role_source,
         "interviewPlan": _build_role_specific_interview_plan(interview_role),
         "resumeSummary": candidate.get("ai_summary") or "Resume summary pending. Ask structured role-fit questions.",
-        "aiOutputMode": settings.interview_ai_output_mode,
+        "aiOutputMode": _effective_interview_output_mode(),
     }
 
 
 @router.post("/candidate/interview-session/{session_id}/realtime-token")
 def candidate_interview_session_realtime_token(request_obj: Request, session_id: str) -> dict[str, Any]:
-    access_token = _get_bearer_token(request_obj)
-    user = _get_supabase_user(access_token)
-    candidate = _get_or_create_candidate(user)
-
-    if not settings.openai_api_key:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="OpenAI realtime is not configured",
-        )
-
     if not _is_valid_uuid(session_id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid session ID format",
         )
+
+    access_token = _get_bearer_token(request_obj)
+    user = _get_supabase_user(access_token)
+    candidate = _get_or_create_candidate(user)
 
     session_rows = _supabase_request(
         f"/rest/v1/interview_sessions?id=eq.{quote(session_id)}&candidate_id=eq.{quote(candidate['id'])}&select=*",
@@ -1804,47 +1957,180 @@ def candidate_interview_session_realtime_token(request_obj: Request, session_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview session not found")
 
     session_row = session_rows[0] if isinstance(session_rows, list) else session_rows
-    if session_row.get("status") != "in_progress":
+    session_status = (session_row.get("status") or "").strip().lower()
+    if session_status != "in_progress":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Realtime token can only be issued for an in-progress interview session",
+        )
+
+    realtime_provider = get_llm_provider_by_name(settings.interview_realtime_provider)
+    if not realtime_provider.is_configured():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Realtime provider is not configured for this deployment",
+        )
+
+    interview_role = session_row.get("interview_role") or _resolve_interview_role(candidate)[0]
+    job_specs = _supabase_request(
+        f"/rest/v1/job_specifications?candidate_id=eq.{quote(candidate['id'])}&select=*&order=created_at.desc&limit=1",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+    latest_job_spec = None
+    if job_specs and isinstance(job_specs, list) and job_specs:
+        latest_job_spec_record = job_specs[0]
+        if latest_job_spec_record.get("parsed_data") and isinstance(latest_job_spec_record.get("parsed_data"), dict):
+            latest_job_spec = latest_job_spec_record.get("parsed_data")
+
+    interview_plan = _build_role_specific_interview_plan(interview_role, latest_job_spec)
+    resume_summary = candidate.get("ai_summary") or "Resume summary pending. Ask structured role-fit questions."
+
+    try:
+        realtime_payload = realtime_provider.create_realtime_session(
+            interview_role=interview_role,
+            interview_plan=interview_plan,
+            resume_summary=resume_summary,
+            include_client_secret=True,
+        )
+    except LLMProviderError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=str(exc),
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Unable to create realtime session",
+        ) from exc
+
+    if not isinstance(realtime_payload, dict):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Unexpected realtime provider response",
+        )
+
+    client_secret = None
+    client_secret_payload = realtime_payload.get("client_secret")
+    if isinstance(client_secret_payload, dict):
+        maybe_value = client_secret_payload.get("value")
+        if isinstance(maybe_value, str) and maybe_value.strip():
+            client_secret = maybe_value.strip()
+
+    if not client_secret:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Realtime client secret missing in provider response",
+        )
+
+    max_questions = settings.interview_max_questions
+    if isinstance(interview_plan.get("realtime"), dict):
+        plan_max_questions = interview_plan["realtime"].get("maxQuestions")
+        if isinstance(plan_max_questions, int) and plan_max_questions > 0:
+            max_questions = plan_max_questions
+
+    return {
+        "realtime": {
+            "id": realtime_payload.get("id"),
+            "model": realtime_payload.get("model") or settings.interview_realtime_model,
+            "expiresAt": realtime_payload.get("expires_at"),
+            "clientSecret": client_secret,
+            "maxQuestions": max_questions,
+        }
+    }
+
+
+@router.post("/candidate/interview-session/{session_id}/groq-next-question")
+def candidate_interview_session_groq_next_question(
+    request_obj: Request,
+    session_id: str,
+    payload: InterviewSessionNextQuestionPayload,
+) -> dict[str, Any]:
+    if settings.interview_realtime_provider != "groq":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Groq voice mode is not enabled for this deployment",
+        )
+
+    if not _is_valid_uuid(session_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid session ID format",
+        )
+
+    access_token = _get_bearer_token(request_obj)
+    user = _get_supabase_user(access_token)
+    candidate = _get_or_create_candidate(user)
+
+    session_rows = _supabase_request(
+        f"/rest/v1/interview_sessions?id=eq.{quote(session_id)}&candidate_id=eq.{quote(candidate['id'])}&select=*",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+    if not session_rows:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview session not found")
+
+    session_row = session_rows[0] if isinstance(session_rows, list) else session_rows
+    session_status = (session_row.get("status") or "").strip().lower()
+    if session_status != "in_progress":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Interview session is not in progress",
         )
 
-    interview_role, _role_source = _resolve_interview_role(candidate)
-    if isinstance(session_row, dict) and session_row.get("interview_role"):
-        interview_role = session_row.get("interview_role")
+    interview_role = session_row.get("interview_role") or _resolve_interview_role(candidate)[0]
 
-    interview_plan = _build_role_specific_interview_plan(interview_role)
-    resume_summary = candidate.get("ai_summary") or "Resume summary pending. Ask structured role-fit questions."
-    realtime_response = _create_openai_realtime_session(
-        interview_role,
-        interview_plan,
-        resume_summary,
-        include_client_secret=True,
+    job_specs = _supabase_request(
+        f"/rest/v1/job_specifications?candidate_id=eq.{quote(candidate['id'])}&select=*&order=created_at.desc&limit=1",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
     )
+    latest_job_spec = None
+    if job_specs and isinstance(job_specs, list) and job_specs:
+        latest_job_spec_record = job_specs[0]
+        if latest_job_spec_record.get("parsed_data") and isinstance(latest_job_spec_record.get("parsed_data"), dict):
+            latest_job_spec = latest_job_spec_record.get("parsed_data")
 
-    if not isinstance(realtime_response, dict):
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Unable to create realtime session",
-        )
+    interview_plan = _build_role_specific_interview_plan(interview_role, latest_job_spec)
+    max_questions = interview_plan.get("realtime", {}).get("maxQuestions") if isinstance(interview_plan.get("realtime"), dict) else settings.interview_max_questions
+    if not isinstance(max_questions, int) or max_questions < 1:
+        max_questions = max(1, settings.interview_max_questions)
 
-    client_secret = realtime_response.get("client_secret") if isinstance(realtime_response.get("client_secret"), dict) else {}
-    client_secret_value = client_secret.get("value") if isinstance(client_secret.get("value"), str) else None
-    if not client_secret_value:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Realtime session token missing",
+    questions_asked = payload.questionsAsked if isinstance(payload.questionsAsked, int) and payload.questionsAsked >= 0 else 0
+    next_question_number = questions_asked + 1
+    if next_question_number > max_questions:
+        return {
+            "completed": True,
+            "questionNumber": questions_asked,
+            "maxQuestions": max_questions,
+        }
+
+    transcript_turns = payload.transcriptTurns if isinstance(payload.transcriptTurns, list) else []
+    resume_summary = candidate.get("ai_summary") or "Resume summary pending. Ask structured role-fit questions."
+
+    try:
+        question_text = _generate_groq_dynamic_question(
+            interview_role=interview_role,
+            interview_plan=interview_plan,
+            resume_summary=resume_summary,
+            transcript_turns=transcript_turns,
+            next_question_number=next_question_number,
+            max_questions=max_questions,
         )
+    except SupabaseError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=_friendly_interview_provider_error_message(str(exc)),
+        ) from exc
 
     return {
-        "sessionId": session_id,
-        "realtime": {
-            "id": realtime_response.get("id"),
-            "model": realtime_response.get("model") or "gpt-4o-realtime-preview-2024-12-17",
-            "expiresAt": realtime_response.get("expires_at"),
-            "clientSecret": client_secret_value,
-        },
+        "completed": False,
+        "question": question_text,
+        "questionNumber": next_question_number,
+        "maxQuestions": max_questions,
     }
 
 
@@ -2080,12 +2366,22 @@ def candidate_interview_session_complete(
             detail="Cannot complete interview without prior explicit consent"
         )
     
-    # SECURITY FIX: Prevent duplicate completions
+    # Idempotent completion for retries after successful finalize.
     if session_row.get("status") == "completed":
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Interview session already completed"
-        )
+        return {
+            "message": "Interview session already completed",
+            "sessionId": session_id,
+            "status": "completed",
+            "endedAt": session_row.get("ended_at"),
+        }
+
+    if session_row.get("status") in {"failed", "terminated"}:
+        return {
+            "message": "Interview session already finalized",
+            "sessionId": session_id,
+            "status": session_row.get("status"),
+            "endedAt": session_row.get("ended_at"),
+        }
 
     # SECURITY FIX #3: Require session-bound single-use upload nonce for media artifacts
     if payload.videoPath:
@@ -2205,22 +2501,46 @@ def candidate_interview_session_complete(
             }
         )
 
-    artifact_rows = _supabase_request(
-        "/rest/v1/interview_artifacts?select=*",
-        method="POST",
-        body={
-            "session_id": session_id,
-            "candidate_id": candidate["id"],
-            "audio_path": payload.audioPath,
-            "audio_url": payload.audioUrl,
-            "video_path": payload.videoPath,
-            "video_url": payload.videoUrl,
-            "transcript": payload.transcript,
-            "score_payload": final_score_payload,
-        },
+    existing_artifacts = _supabase_request(
+        f"/rest/v1/interview_artifacts?session_id=eq.{quote(session_id)}&candidate_id=eq.{quote(candidate['id'])}&select=*&order=created_at.desc&limit=1",
+        method="GET",
         bearer_token=settings.supabase_service_role_key,
         use_service_role=True,
     )
+    existing_artifact = existing_artifacts[0] if isinstance(existing_artifacts, list) and existing_artifacts else None
+
+    if existing_artifact and existing_artifact.get("id"):
+        artifact_rows = _supabase_request(
+            f"/rest/v1/interview_artifacts?id=eq.{quote(existing_artifact['id'])}&select=*",
+            method="PATCH",
+            body={
+                "audio_path": payload.audioPath,
+                "audio_url": payload.audioUrl,
+                "video_path": payload.videoPath,
+                "video_url": payload.videoUrl,
+                "transcript": payload.transcript,
+                "score_payload": final_score_payload,
+            },
+            bearer_token=settings.supabase_service_role_key,
+            use_service_role=True,
+        )
+    else:
+        artifact_rows = _supabase_request(
+            "/rest/v1/interview_artifacts?select=*",
+            method="POST",
+            body={
+                "session_id": session_id,
+                "candidate_id": candidate["id"],
+                "audio_path": payload.audioPath,
+                "audio_url": payload.audioUrl,
+                "video_path": payload.videoPath,
+                "video_url": payload.videoUrl,
+                "transcript": payload.transcript,
+                "score_payload": final_score_payload,
+            },
+            bearer_token=settings.supabase_service_role_key,
+            use_service_role=True,
+        )
 
     # PostgREST may return an empty body for insert unless representation is requested.
     # Re-fetch latest artifact for this session to guarantee a stable response shape.

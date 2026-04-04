@@ -7,7 +7,7 @@ import api from '../../lib/axios';
 import Button from '../../components/ui/Button';
 import Card from '../../components/ui/Card';
 import Input from '../../components/ui/Input';
-import { buildResumePath, MAX_RESUME_SIZE_BYTES, RESUME_BUCKET } from '../../lib/resumeStorage';
+import { buildResumePath, MAX_RESUME_SIZE_BYTES, RESUME_BUCKET, sanitizeResumeFileName } from '../../lib/resumeStorage';
 import { supabase } from '../../lib/supabase';
 
 export default function ProfileUpload() {
@@ -18,6 +18,8 @@ export default function ProfileUpload() {
   const [uploadProgress, setUploadProgress] = useState(0);
   const [lastUpload, setLastUpload] = useState(null);
   const [lastJobSpecUpload, setLastJobSpecUpload] = useState(null);
+  const [pendingResumeUpload, setPendingResumeUpload] = useState(null);
+  const [pendingJobSpecUpload, setPendingJobSpecUpload] = useState(null);
   const inputRef = useRef(null);
   const jobSpecInputRef = useRef(null);
 
@@ -63,6 +65,101 @@ export default function ProfileUpload() {
         })
         .catch(reject);
     });
+  };
+
+  const cancelResumeUpload = async () => {
+    if (pendingResumeUpload?.path) {
+      try {
+        await supabase.storage.from(RESUME_BUCKET).remove([pendingResumeUpload.path]);
+        toast.success('Resume upload cancelled and file removed');
+      } catch (error) {
+        toast.error('Unable to remove uploaded resume');
+      }
+    }
+    setPendingResumeUpload(null);
+  };
+
+  const cancelJobSpecUpload = async () => {
+    if (pendingJobSpecUpload?.path) {
+      try {
+        await supabase.storage.from(RESUME_BUCKET).remove([pendingJobSpecUpload.path]);
+        toast.success('Job description upload cancelled and file removed');
+      } catch (error) {
+        toast.error('Unable to remove uploaded job description');
+      }
+    }
+    setPendingJobSpecUpload(null);
+  };
+
+  const confirmResumeUpload = async () => {
+    if (!pendingResumeUpload) return;
+
+    try {
+      setSubmitting(true);
+      const response = await api.post('/candidate/profile-upload', {
+        filename: pendingResumeUpload.fileName,
+        size: pendingResumeUpload.fileSize,
+        type: pendingResumeUpload.type,
+        filePath: pendingResumeUpload.path,
+        fileUrl: pendingResumeUpload.publicUrl,
+        targetRole: targetRole.trim(),
+        submittedAt: new Date().toISOString(),
+      });
+
+      setLastUpload(response.data?.upload ?? pendingResumeUpload);
+      toast.success('Resume uploaded and queued for AI parsing');
+      setPendingResumeUpload(null);
+      setFile(null);
+      if (inputRef.current) {
+        inputRef.current.value = '';
+      }
+    } catch (error) {
+      const errorMsg = error.message || 'Unable to save resume metadata';
+      if (errorMsg.includes('401') || errorMsg.includes('Unauthorized')) {
+        toast.error('Your session has expired. Please sign in again.', { duration: 5000 });
+      } else if (errorMsg.includes('CORS') || errorMsg.includes('ERR_FAILED') || errorMsg.includes('connect')) {
+        toast.error('Server is not reachable. Please ensure the backend is running.', { duration: 5000 });
+      } else {
+        toast.error(errorMsg, { duration: 4000 });
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const confirmJobSpecUpload = async () => {
+    if (!pendingJobSpecUpload) return;
+
+    try {
+      setSubmitting(true);
+      const response = await api.post('/candidate/job-specification-upload', {
+        filename: pendingJobSpecUpload.fileName,
+        size: pendingJobSpecUpload.fileSize,
+        type: pendingJobSpecUpload.type,
+        filePath: pendingJobSpecUpload.path,
+        fileUrl: pendingJobSpecUpload.publicUrl,
+        submittedAt: new Date().toISOString(),
+      });
+
+      setLastJobSpecUpload(response.data?.upload ?? pendingJobSpecUpload);
+      toast.success('Job specification uploaded and queued for parsing');
+      setPendingJobSpecUpload(null);
+      setJobSpecFile(null);
+      if (jobSpecInputRef.current) {
+        jobSpecInputRef.current.value = '';
+      }
+    } catch (error) {
+      const errorMsg = error.message || 'Unable to save job specification metadata';
+      if (errorMsg.includes('401') || errorMsg.includes('Unauthorized')) {
+        toast.error('Your session has expired. Please sign in again.', { duration: 5000 });
+      } else if (errorMsg.includes('CORS') || errorMsg.includes('ERR_FAILED') || errorMsg.includes('connect')) {
+        toast.error('Server is not reachable. Please ensure the backend is running.', { duration: 5000 });
+      } else {
+        toast.error(errorMsg, { duration: 4000 });
+      }
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   const onFileChange = (event) => {
@@ -127,7 +224,6 @@ export default function ProfileUpload() {
     }
 
     let uploadedPath = null;
-    let jobSpecUploadedPath = null;
     setUploadProgress(0);
 
     try {
@@ -138,13 +234,19 @@ export default function ProfileUpload() {
       } = await supabase.auth.getSession();
 
       if (userError) {
-        throw userError;
+        throw new Error('Unable to verify login status. Please try again.');
       }
 
       const user = session?.user;
 
       if (!user) {
-        throw new Error('You must be signed in to upload a resume');
+        toast.error('Please sign in to your account to upload files', { duration: 5000 });
+        throw new Error('Not authenticated');
+      }
+
+      if (!session?.access_token) {
+        toast.error('Your session has expired. Please sign in again.', { duration: 5000 });
+        throw new Error('No access token');
       }
 
       uploadedPath = buildResumePath(user.id, file.name);
@@ -156,76 +258,65 @@ export default function ProfileUpload() {
         data: { publicUrl },
       } = supabase.storage.from(RESUME_BUCKET).getPublicUrl(uploadedPath);
 
-      const response = await api.post('/candidate/profile-upload', {
-        filename: file.name,
-        size: file.size,
+      // Show confirmation dialog before committing to backend
+      setPendingResumeUpload({
+        path: uploadedPath,
+        fileName: file.name,
+        fileSize: file.size,
         type: file.type,
-        filePath: uploadedPath,
-        fileUrl: publicUrl,
-        targetRole: targetRole.trim(),
-        submittedAt: new Date().toISOString(),
+        publicUrl,
       });
-
-      setLastUpload(response.data?.upload ?? {
-        file_name: file.name,
-        file_path: uploadedPath,
-        file_url: publicUrl,
-        file_size: file.size,
-        mime_type: file.type,
-      });
-      toast.success('Resume uploaded and queued for AI parsing');
-      setFile(null);
-      if (inputRef.current) {
-        inputRef.current.value = '';
-      }
+      setUploadProgress(100);
 
       // Upload job specification if provided
       if (jobSpecFile) {
+        const safeJobSpecFileName = sanitizeResumeFileName(jobSpecFile.name);
+        const jobSpecUploadedPath = `${user.id}/job-specs/${Date.now()}_${safeJobSpecFileName}`;
+        
         try {
-          jobSpecUploadedPath = `job-specs/${user.id}/${Date.now()}_${jobSpecFile.name}`;
           await uploadToSupabaseStorage(jobSpecFile, jobSpecUploadedPath);
           
           const {
             data: { publicUrl: jobSpecPublicUrl },
           } = supabase.storage.from(RESUME_BUCKET).getPublicUrl(jobSpecUploadedPath);
 
-          const jobSpecResponse = await api.post('/candidate/job-specification-upload', {
-            filename: jobSpecFile.name,
-            size: jobSpecFile.size,
+          // Show confirmation dialog before committing to backend
+          setPendingJobSpecUpload({
+            path: jobSpecUploadedPath,
+            fileName: jobSpecFile.name,
+            fileSize: jobSpecFile.size,
             type: jobSpecFile.type,
-            filePath: jobSpecUploadedPath,
-            fileUrl: jobSpecPublicUrl,
-            submittedAt: new Date().toISOString(),
+            publicUrl: jobSpecPublicUrl,
           });
-
-          setLastJobSpecUpload(jobSpecResponse.data?.upload ?? {
-            file_name: jobSpecFile.name,
-            file_path: jobSpecUploadedPath,
-            file_url: jobSpecPublicUrl,
-            file_size: jobSpecFile.size,
-            mime_type: jobSpecFile.type,
-          });
-          toast.success('Job specification uploaded and queued for parsing');
-          setJobSpecFile(null);
-          if (jobSpecInputRef.current) {
-            jobSpecInputRef.current.value = '';
-          }
         } catch (jobSpecError) {
-          if (jobSpecUploadedPath) {
-            await supabase.storage.from(RESUME_BUCKET).remove([jobSpecUploadedPath]);
+          const errorMsg = jobSpecError.message || 'Unable to upload job specification';
+          if (errorMsg.includes('401') || errorMsg.includes('Unauthorized')) {
+            toast.error('Your session has expired. Please sign in again.', { duration: 5000 });
+          } else if (errorMsg.includes('CORS') || errorMsg.includes('ERR_FAILED') || errorMsg.includes('connect')) {
+            toast.error('Server is not reachable. Please ensure the backend is running.', { duration: 5000 });
+          } else {
+            toast.error(errorMsg, { duration: 4000 });
           }
-          toast.error(jobSpecError.message || 'Unable to upload job specification right now');
         }
       }
-
-      setUploadProgress(100);
     } catch (error) {
       if (uploadedPath) {
         await supabase.storage.from(RESUME_BUCKET).remove([uploadedPath]);
       }
 
       setUploadProgress(0);
-      toast.error(error.message || 'Unable to upload resume right now');
+      const errorMsg = error.message || 'Unable to upload resume';
+      if (errorMsg.includes('Not authenticated') || errorMsg.includes('No access token')) {
+        // Auth error already shown in UI above
+        return;
+      }
+      if (errorMsg.includes('401') || errorMsg.includes('Unauthorized')) {
+        toast.error('Your session has expired. Please sign in again.', { duration: 5000 });
+      } else if (errorMsg.includes('CORS') || errorMsg.includes('ERR_FAILED') || errorMsg.includes('connect')) {
+        toast.error('Server is not reachable. Please ensure the backend is running.', { duration: 5000 });
+      } else {
+        toast.error(errorMsg, { duration: 4000 });
+      }
     } finally {
       setSubmitting(false);
     }
@@ -303,6 +394,76 @@ export default function ProfileUpload() {
             </div>
           )}
 
+          {pendingResumeUpload && !submitting && (
+            <div className="space-y-3 rounded-xl border border-amber-200 bg-amber-50 p-4">
+              <p className="font-semibold text-amber-900">Review Resume Upload</p>
+              <div className="space-y-1 text-sm">
+                <p className="text-amber-900">
+                  File: <span className="font-medium">{pendingResumeUpload.fileName}</span>
+                </p>
+                <p className="text-xs text-amber-700">
+                  Size: {(pendingResumeUpload.fileSize / 1024 / 1024).toFixed(2)} MB
+                </p>
+              </div>
+              <p className="text-xs text-amber-700">
+                Your resume has been uploaded to storage. Review and confirm to save metadata or cancel to delete.
+              </p>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={cancelResumeUpload}
+                  disabled={submitting}
+                  className="flex-1 rounded-lg border border-amber-300 bg-white px-4 py-2 text-sm font-semibold text-amber-700 transition hover:bg-amber-50 disabled:opacity-50"
+                >
+                  Cancel Upload
+                </button>
+                <button
+                  type="button"
+                  onClick={confirmResumeUpload}
+                  disabled={submitting}
+                  className="flex-1 rounded-lg bg-amber-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-amber-700 disabled:opacity-50"
+                >
+                  Confirm & Save
+                </button>
+              </div>
+            </div>
+          )}
+
+          {pendingJobSpecUpload && !submitting && (
+            <div className="space-y-3 rounded-xl border border-blue-200 bg-blue-50 p-4">
+              <p className="font-semibold text-blue-900">Review Job Description Upload</p>
+              <div className="space-y-1 text-sm">
+                <p className="text-blue-900">
+                  File: <span className="font-medium">{pendingJobSpecUpload.fileName}</span>
+                </p>
+                <p className="text-xs text-blue-700">
+                  Size: {(pendingJobSpecUpload.fileSize / 1024 / 1024).toFixed(2)} MB
+                </p>
+              </div>
+              <p className="text-xs text-blue-700">
+                Your job description has been uploaded to storage. Review and confirm to save metadata or cancel to delete.
+              </p>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={cancelJobSpecUpload}
+                  disabled={submitting}
+                  className="flex-1 rounded-lg border border-blue-300 bg-white px-4 py-2 text-sm font-semibold text-blue-700 transition hover:bg-blue-50 disabled:opacity-50"
+                >
+                  Cancel Upload
+                </button>
+                <button
+                  type="button"
+                  onClick={confirmJobSpecUpload}
+                  disabled={submitting}
+                  className="flex-1 rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-blue-700 disabled:opacity-50"
+                >
+                  Confirm & Save
+                </button>
+              </div>
+            </div>
+          )}
+
           {lastUpload && !submitting && (
             <div className="space-y-2 rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-900">
               <p className="font-semibold">Resume uploaded</p>
@@ -347,9 +508,11 @@ export default function ProfileUpload() {
             Your PDFs are uploaded directly to Supabase Storage first, then the backend stores the file metadata and parses the content for AI analysis.
           </p>
 
-          <Button type="submit" disabled={submitting} className="w-full">
-            {submitting ? 'Submitting...' : 'Submit Resume'}
-          </Button>
+          {!pendingResumeUpload && !pendingJobSpecUpload && (
+            <Button type="submit" disabled={submitting} className="w-full">
+              {submitting ? 'Uploading...' : 'Upload Resume'}
+            </Button>
+          )}
         </form>
       </Card>
     </motion.div>

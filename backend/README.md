@@ -51,9 +51,11 @@ Use `backend/.env.example` as the source of truth for backend-only values, inclu
 
 ## AI Resume Summarization
 
-The resume analysis endpoint uses OpenAI when `OPENAI_API_KEY` is set.
+The resume analysis endpoint uses the configured LLM provider (`LLM_PROVIDER`).
 
-- Default model: `gpt-4o-mini`
+- Supported providers: `openrouter`, `groq`
+- Default provider: `openrouter`
+- Default model: `openai/gpt-4o-mini` (via OpenRouter)
 - Keep requests short by extracting only the relevant resume text before sending it to the model
-- Review OpenAI pricing and rate limits before enabling production traffic
+- Review provider pricing and rate limits before enabling production traffic
 - Scoring is strict LLM-based, with retry/backoff and pending status handling instead of heuristic fallback

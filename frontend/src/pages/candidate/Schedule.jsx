@@ -7,13 +7,16 @@ import toast from 'react-hot-toast';
 import Button from '../../components/ui/Button';
 import Card from '../../components/ui/Card';
 import api from '../../lib/axios';
+import { useAuth } from '../../contexts/AuthContext';
 
 export default function Schedule() {
   const navigate = useNavigate();
+  const { clearInterviewLock } = useAuth();
   const [submitting, setSubmitting] = useState(false);
   const [currentTime, setCurrentTime] = useState(() => new Date());
   const [timeOffsetMs, setTimeOffsetMs] = useState(0);
   const [startedAt, setStartedAt] = useState(null);
+  const [latestSession, setLatestSession] = useState(null);
   const [interviewRole, setInterviewRole] = useState('General Candidate');
   const [interviewPlan, setInterviewPlan] = useState(null);
 
@@ -22,9 +25,13 @@ export default function Schedule() {
       try {
         const response = await api.get('/candidate/interview-slots');
         const latest = response.data?.latestStarted;
+        const latestSessionRow = response.data?.latestSession;
         const plan = response.data?.interviewPlan;
+        setLatestSession(latestSessionRow || null);
         if (latest?.slot_time) {
           setStartedAt(latest.slot_time);
+        } else {
+          clearInterviewLock();
         }
         if (plan) {
           setInterviewPlan(plan);
@@ -32,6 +39,8 @@ export default function Schedule() {
         }
       } catch (_error) {
         setInterviewPlan(null);
+        setLatestSession(null);
+        clearInterviewLock();
       }
     };
 
@@ -49,7 +58,7 @@ export default function Schedule() {
 
     fetchInterviewContext();
     fetchServerTime();
-  }, []);
+  }, [clearInterviewLock]);
 
   useEffect(() => {
     const intervalId = window.setInterval(() => {
@@ -62,7 +71,15 @@ export default function Schedule() {
   const onStartInterview = async () => {
     try {
       setSubmitting(true);
-      toast.success('Interview started');
+      if (latestSession?.status === 'completed') {
+        toast('Interview already submitted for this application stage.');
+        navigate('/candidate', { replace: true });
+        return;
+      }
+      if (latestSession?.status === 'terminated') {
+        toast('Interview was previously terminated for this stage.');
+      }
+      toast.success('Opening interview room');
       navigate('/interview/live');
     } catch (_error) {
       toast.error('Unable to start interview right now');
@@ -71,19 +88,27 @@ export default function Schedule() {
     }
   };
 
-  const hasStartedInterview = Boolean(startedAt);
-
   const formatUtcTime = (value) => {
     if (!value) {
       return '';
     }
 
-    return new Intl.DateTimeFormat('en-US', {
-      dateStyle: 'medium',
-      timeStyle: 'medium',
-      timeZone: 'UTC',
-      timeZoneName: 'short',
-    }).format(new Date(value));
+    try {
+      // Avoid combining style shortcuts with timezone name because some runtimes reject it.
+      return new Intl.DateTimeFormat('en-US', {
+        year: 'numeric',
+        month: 'short',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: true,
+        timeZone: 'UTC',
+        timeZoneName: 'short',
+      }).format(new Date(value));
+    } catch (_error) {
+      return `${new Date(value).toUTCString()} UTC`;
+    }
   };
 
   return (
@@ -116,9 +141,21 @@ export default function Schedule() {
           <p className="mt-1 font-medium text-slate-900">{currentTime.toLocaleString()}</p>
         </div>
 
-        <Button className="mt-5" onClick={onStartInterview} disabled={submitting || hasStartedInterview}>
-          {submitting ? 'Starting...' : hasStartedInterview ? 'Interview Started' : 'Start Interview'}
+        <Button className="mt-5" onClick={onStartInterview} disabled={submitting}>
+          {submitting
+            ? 'Opening...'
+            : latestSession?.status === 'completed'
+              ? 'Interview Completed'
+              : startedAt
+                ? 'Enter Interview Room'
+                : 'Start Interview'}
         </Button>
+
+        {latestSession?.status === 'completed' && (
+          <p className="mt-3 text-sm text-slate-600">
+            This interview stage is already completed. You can view progress from your dashboard.
+          </p>
+        )}
 
         {startedAt && (
           <div className="mt-5 rounded-xl border border-teal-200 bg-teal-50 p-4">
